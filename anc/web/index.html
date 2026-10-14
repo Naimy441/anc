@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark" />
+  <title>ANC · Noise Cancellation</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' x2='1'%3E%3Cstop offset='0' stop-color='%2322d3ee'/%3E%3Cstop offset='1' stop-color='%238b5cf6'/%3E%3C/linearGradient%3E%3C/defs%3E%3Ccircle cx='16' cy='16' r='14' fill='none' stroke='url(%23g)' stroke-width='3'/%3E%3Cpath d='M8 16h3l2-6 3 12 3-9 2 3h3' fill='none' stroke='url(%23g)' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+  <div class="aurora" aria-hidden="true"><span></span><span></span><span></span></div>
+
+  <header class="topbar">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
+        <defs><linearGradient id="bm" x1="0" x2="1"><stop offset="0" stop-color="#22d3ee"/><stop offset="1" stop-color="#8b5cf6"/></linearGradient></defs>
+        <circle cx="16" cy="16" r="14" fill="none" stroke="url(#bm)" stroke-width="2.5"/>
+        <path id="brandWave" d="M7 16h3l2-6 3 12 3-9 2 3h5" fill="none" stroke="url(#bm)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <div>
+        <div class="brand-name">ANC<span>studio</span></div>
+        <div class="brand-sub">Real-time neural noise cancellation</div>
+      </div>
+    </div>
+    <div class="top-stats">
+      <div class="pill" id="statusPill"><i></i><span id="statusText">Connecting…</span></div>
+      <div class="chip-stat"><label>Latency</label><b id="topLatency">–</b></div>
+      <div class="chip-stat"><label>DSP load</label><b id="topCpu">–</b></div>
+      <div class="chip-stat hide-sm"><label>Engine</label><b id="topEngine">–</b></div>
+    </div>
+  </header>
+
+  <main class="grid">
+    <!-- HERO ----------------------------------------------------------->
+    <section class="card hero" style="--d:0">
+      <div class="dial-wrap">
+        <canvas id="ringCanvas" class="ring-canvas"></canvas>
+        <svg id="dial" class="dial" viewBox="0 0 320 320" role="slider" tabindex="0"
+             aria-label="Noise reduction" aria-valuemin="0" aria-valuemax="100" aria-valuenow="100">
+          <defs>
+            <linearGradient id="arcGrad" x1="0" y1="1" x2="1" y2="0">
+              <stop offset="0" stop-color="#22d3ee"/><stop offset="0.55" stop-color="#6366f1"/><stop offset="1" stop-color="#c084fc"/>
+            </linearGradient>
+            <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+              <feGaussianBlur stdDeviation="4" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+            </filter>
+          </defs>
+          <g id="ticks"></g>
+          <path id="arcTrack" class="arc-track" d="" />
+          <path id="arcValue" class="arc-value" d="" filter="url(#glow)" />
+          <path id="arcHit" class="arc-hit" d="" />
+          <circle id="knob" class="knob" r="9" cx="0" cy="0" />
+        </svg>
+        <button id="power" class="power" aria-pressed="false" title="Start / stop (Space)">
+          <span class="power-glow"></span>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v8" /><path d="M6.3 6.8a8 8 0 1 0 11.4 0" /></svg>
+          <span id="powerLabel" class="power-label">Activate</span>
+        </button>
+      </div>
+
+      <div class="reduction-readout">
+        <div class="rr-label">Noise reduction</div>
+        <div class="rr-value"><span id="redValue">100</span><small>%</small></div>
+        <div class="rr-sub" id="redSub">full suppression</div>
+      </div>
+
+      <div class="quick">
+        <button class="qbtn" id="bypassBtn" title="A/B compare with the raw input (B)">
+          <svg viewBox="0 0 24 24"><path d="M4 7h10M4 17h6M14 7l6 10M20 7l-6 10"/></svg><span>Bypass</span>
+        </button>
+        <button class="qbtn" id="muteBtn" title="Mute processed output (M)">
+          <svg viewBox="0 0 24 24"><path d="M5 9v6h4l5 4V5L9 9H5z"/><path class="mute-x" d="M17 9l4 6M21 9l-4 6"/></svg><span>Mute</span>
+        </button>
+        <button class="qbtn" id="learnBtn" title="Capture a noise-only profile (Spectral / Hybrid)">
+          <svg viewBox="0 0 24 24"><path d="M3 12h3l3-7 4 14 3-7h5"/></svg><span>Learn noise</span>
+        </button>
+      </div>
+
+      <div class="tiles">
+        <div class="tile accent">
+          <label>Noise removed</label>
+          <b><span id="removedVal">0.0</span><small> dB</small></b>
+          <div class="tile-bar"><i id="removedBar"></i></div>
+        </div>
+        <div class="tile">
+          <label>Voice activity</label>
+          <b><span id="voiceVal">–</span></b>
+          <div class="voice-dots" id="voiceDots"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+        </div>
+      </div>
+
+      <div class="meters">
+        <div class="meter" id="meterIn"><label>IN</label><div class="track"><i class="lvl"></i><i class="pk"></i></div><span class="db">–∞</span></div>
+        <div class="meter out" id="meterOut"><label>OUT</label><div class="track"><i class="lvl"></i><i class="pk"></i></div><span class="db">–∞</span></div>
+        <div class="meter-scale"><span>-60</span><span>-48</span><span>-36</span><span>-24</span><span>-12</span><span>0</span></div>
+      </div>
+    </section>
+
+    <!-- VISUALISER ------------------------------------------------------>
+    <section class="card viz" style="--d:1">
+      <div class="card-head">
+        <h2>Live spectrum</h2>
+        <div class="legend"><span class="lg in"></span>Noisy input <span class="lg out"></span>Cancelled output</div>
+        <div class="seg small" id="specMode">
+          <button data-v="both" class="on">Both</button><button data-v="out">Output</button><button data-v="in">Input</button>
+        </div>
+      </div>
+      <div class="canvas-box spectrum-box"><canvas id="spectrum"></canvas><div class="idle-note" id="idleNote">Press <b>Activate</b> to start listening</div></div>
+      <div class="card-head sub">
+        <h3>Spectrogram</h3>
+        <div class="seg small" id="sgramMode">
+          <button data-v="split" class="on">Split</button><button data-v="out">Output</button><button data-v="in">Input</button>
+        </div>
+      </div>
+      <div class="canvas-box sgram-box"><canvas id="sgram"></canvas></div>
+    </section>
+
+    <!-- CONTROLS -------------------------------------------------------->
+    <section class="card controls" style="--d:2">
+      <div class="card-head"><h2>Presets</h2></div>
+      <div class="presets" id="presets"></div>
+
+      <div class="card-head"><h2>Engine</h2></div>
+      <div class="engines" id="engines">
+        <button data-engine="neural"><b>Neural</b><span>DeepFilterNet3 · 48 kHz full-band</span><em>32 ms</em></button>
+        <button data-engine="hybrid"><b>Hybrid</b><span>Neural + OM-LSA residual suppressor</span><em>48 ms</em></button>
+        <button data-engine="spectral"><b>Spectral</b><span>OM-LSA · MMSE noise tracking · lowest CPU</span><em>16 ms</em></button>
+      </div>
+
+      <details class="group" open>
+        <summary><span>Audio devices</span><button class="icon-btn" id="refreshDevices" title="Rescan devices" type="button"><svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/></svg></button></summary>
+        <label class="field"><span>Input (microphone)</span><select data-key="input_device" id="inputDevice"></select></label>
+        <label class="field"><span>Output</span><select data-key="output_device" id="outputDevice"></select></label>
+        <div class="row2">
+          <label class="field"><span>Input channel</span>
+            <select data-key="input_channel" id="inputChannel"><option value="-1">Mix all</option></select></label>
+          <label class="field"><span>Buffering</span>
+            <select data-key="latency_mode"><option value="ultra">Ultra-low</option><option value="balanced">Balanced</option><option value="safe">Safe</option></select></label>
+        </div>
+        <p class="hint" id="deviceHint">Use headphones when monitoring to avoid feedback. To use the cleaned mic in Zoom/Discord/OBS, pick a virtual cable (BlackHole, VB-CABLE, PipeWire null sink) as output.</p>
+      </details>
+
+      <details class="group" open>
+        <summary><span>Levels</span></summary>
+        <div class="slider" data-key="input_gain_db" data-min="-24" data-max="24" data-step="0.5" data-unit="dB" data-label="Input gain"></div>
+        <div class="slider" data-key="output_gain_db" data-min="-24" data-max="24" data-step="0.5" data-unit="dB" data-label="Output gain"></div>
+        <div class="slider" data-key="reduction" data-min="0" data-max="100" data-step="1" data-unit="%" data-label="Noise reduction"></div>
+      </details>
+
+      <details class="group" open>
+        <summary><span>Voice processing</span></summary>
+        <div class="toggle-row"><span>High-pass (rumble / hum)</span><label class="switch"><input type="checkbox" data-key="highpass_enabled"><i></i></label></div>
+        <div class="slider" data-key="highpass_hz" data-min="20" data-max="400" data-step="5" data-unit="Hz" data-label="Cutoff" data-dep="highpass_enabled"></div>
+        <div class="slider" data-key="clarity_db" data-min="0" data-max="9" data-step="0.5" data-unit="dB" data-label="Voice clarity"></div>
+        <div class="toggle-row"><span>Residual noise gate</span><label class="switch"><input type="checkbox" data-key="gate_enabled"><i></i></label></div>
+        <div class="slider" data-key="gate_threshold_db" data-min="-90" data-max="-20" data-step="1" data-unit="dB" data-label="Threshold" data-dep="gate_enabled"></div>
+        <div class="slider" data-key="gate_range_db" data-min="6" data-max="80" data-step="1" data-unit="dB" data-label="Depth" data-dep="gate_enabled"></div>
+        <div class="toggle-row"><span>Auto gain (AGC)</span><label class="switch"><input type="checkbox" data-key="agc_enabled"><i></i></label></div>
+        <div class="slider" data-key="agc_target_db" data-min="-36" data-max="-10" data-step="1" data-unit="dBFS" data-label="Target level" data-dep="agc_enabled"></div>
+        <div class="toggle-row"><span>Output limiter</span><label class="switch"><input type="checkbox" data-key="limiter_enabled"><i></i></label></div>
+        <div class="slider" data-key="limiter_ceiling_db" data-min="-12" data-max="0" data-step="0.5" data-unit="dBFS" data-label="Ceiling" data-dep="limiter_enabled"></div>
+      </details>
+
+      <details class="group" id="spectralGroup">
+        <summary><span>Spectral tuning</span><em class="badge">Spectral · Hybrid</em></summary>
+        <div class="slider" data-key="spectral_aggressiveness" data-min="0.5" data-max="3" data-step="0.05" data-unit="×" data-label="Aggressiveness"></div>
+        <div class="slider" data-key="spectral_smoothing" data-min="0.8" data-max="0.995" data-step="0.005" data-unit="" data-label="Smoothing (anti-musical-noise)"></div>
+        <label class="field"><span>Noise model</span>
+          <select data-key="noise_mode"><option value="adaptive">Adaptive tracking</option><option value="learned">Learned profile (frozen)</option><option value="hybrid">Adaptive + learned floor</option></select></label>
+        <div class="learn-row"><span id="learnStatus">No profile captured</span><button class="ghost" id="clearLearned" type="button">Clear</button></div>
+      </details>
+
+      <div class="reset-row"><button class="ghost" id="resetBtn" type="button">Reset to defaults</button></div>
+    </section>
+
+    <!-- FILE LAB -------------------------------------------------------->
+    <section class="card lab" style="--d:3">
+      <div class="card-head"><h2>File lab</h2><span class="muted">Run any recording through the exact same chain</span></div>
+      <label class="drop" id="drop">
+        <input type="file" id="fileInput" accept="audio/*,.wav,.flac,.ogg,.mp3" hidden />
+        <svg viewBox="0 0 24 24"><path d="M12 16V4M7 9l5-5 5 5M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg>
+        <span id="dropText">Drop an audio file or <u>browse</u></span>
+      </label>
+      <div class="lab-result" id="labResult" hidden>
+        <canvas id="labWave"></canvas>
+        <div class="lab-controls">
+          <button class="qbtn" id="labPlay"><svg viewBox="0 0 24 24"><path id="labPlayIcon" d="M7 5l12 7-12 7z"/></svg><span>Play</span></button>
+          <div class="seg" id="labAB"><button data-v="orig">Original</button><button data-v="clean" class="on">Denoised</button></div>
+          <a class="ghost" id="labDownload" download="denoised.wav">Download</a>
+        </div>
+        <div class="muted" id="labInfo"></div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <div class="stats" id="footStats">
+      <span>Rate <b id="fRate">–</b></span><span>Block <b id="fBlock">–</b></span><span>Mode <b id="fMode">–</b></span>
+      <span>Proc <b id="fProc">–</b></span><span>Peak proc <b id="fProcMax">–</b></span>
+      <span>Dropouts <b id="fXruns">0</b></span><span>Clipping <b id="fClips">0</b></span>
+    </div>
+    <div class="keys"><kbd>Space</kbd> on/off <kbd>B</kbd> bypass <kbd>M</kbd> mute <kbd>↑</kbd><kbd>↓</kbd> reduction</div>
+  </footer>
+
+  <div class="toasts" id="toasts"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
