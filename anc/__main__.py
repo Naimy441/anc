@@ -14,6 +14,8 @@ def main() -> None:
     ap.add_argument("--no-browser", action="store_true", help="don't open the UI automatically")
     ap.add_argument("--simulate", action="store_true",
                     help="use a synthetic noisy-voice source instead of audio hardware")
+    ap.add_argument("--simulate-feedback", action="store_true",
+                    help="with --simulate: add a speaker-to-mic loop that howls at 4.8 kHz")
     ap.add_argument("--list-devices", action="store_true", help="print audio devices and exit")
     args = ap.parse_args()
 
@@ -23,7 +25,12 @@ def main() -> None:
         print(sd.query_devices())
         return
 
+    import os
+
     import uvicorn
+
+    if args.simulate_feedback:
+        os.environ["ANC_SIM_FEEDBACK"] = "1"
 
     from .server import create_app
 

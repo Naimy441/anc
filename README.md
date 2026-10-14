@@ -16,6 +16,11 @@ web UI on `localhost`.
   applies the one that removes the most noise **without adding artifacts or
   damaging your voice**. It also notches out any hum, and re-tunes itself in the
   background if the noise changes. See [Learn & tune](#learn--tune).
+- **Feedback guard:** detects the squeal you get when the speaker output
+  reaches the mic again (usually 2–6 kHz). It cuts that exact frequency within
+  about 0.1–0.4 s, before the squeal reaches full volume, and freezes auto gain.
+  If a speaker is so close that cuts can't keep up, it lowers the output and
+  tells you. It ignores voices and music. See [Feedback guard](#feedback-guard).
 - **Three engines:** Neural, Hybrid (neural plus a statistical residual
   suppressor) and Spectral (classic OM-LSA, 16 ms latency, very little CPU).
 - **Full voice chain:** high-pass, voice clarity EQ, residual noise gate, AGC,
@@ -62,7 +67,7 @@ Manual alternative:
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python -m anc                 # options: --port 8765 --no-browser --list-devices --simulate
+python -m anc                 # options: --port 8765 --no-browser --list-devices --simulate [--simulate-feedback]
 ```
 
 > **macOS:** the first time, allow microphone access for your terminal app
@@ -99,6 +104,7 @@ microphone in the other app:
 | **Residual noise gate** | Expander with hysteresis and hold. It closes on what little is left between words. |
 | **Auto gain (AGC)** | Slowly levels your voice to a target loudness. It only adapts while you are speaking. |
 | **Output limiter** | Instant attack, smooth release, plus a soft clipper. The output never clips. |
+| **Feedback guard** | On by default. Sensitivity Low / Normal / High, a live list of notched frequencies, and Reset. Notched frequencies are also marked on the spectrum. |
 | **Noise profile panel** | The learned spectrum with hum markers, what it removes, live *drift* (how far the current background is from the learned one), tuning style (Gentle / Balanced / Max), auto re-tune, hum notches, and advanced manual tuning. |
 | **Buffering** | Ultra-low, Balanced or Safe. Use Safe if you hear crackles. |
 | **Presets** | Voice call, Natural, Maximum, Low latency. |
@@ -165,6 +171,52 @@ you change the input gain, the profile is rescaled automatically.
 > well for fan noise, but voices sound band-limited, so wired earbuds or a
 > separate mic sound better.
 
+## Feedback guard
+
+Feedback ("howl") happens when the processed output reaches the mic again:
+speakers, open earbuds, or a headset whose mic sits next to its driver. The loop
+then rings at whichever frequency it amplifies most.
+
+**Detection** runs on the final output every block (2048-point FFT, about every
+10 ms). It uses the standard howling-detection features from van Waterschoot &
+Moonen, *Fifty years of acoustic feedback control* (2011):
+
+| Feature | What a howl looks like |
+|---|---|
+| Peak-to-neighbour ratio | A single line far above the spectrum around it. |
+| Peak-to-harmonic ratio | A pure tone. Voices and instruments always carry harmonics. |
+| Persistence | Locked within ±1 bin for 0.18 s (Normal), with no pitch drift. |
+| Growth | A tone climbing steadily by 30 dB/s or more is caught after half the persistence time. |
+
+Below 1 kHz, where earbud and laptop feedback is rare, the guard waits twice as long.
+
+**Response:**
+1. A narrow cut (Q≈18) at the exact frequency, starting at -15 dB and deepening
+   in 8 dB steps (to -42 dB) if the howl comes back. Up to 8 cuts at once.
+2. A brief -6 dB duck of the output, and auto gain is frozen for 5 s so it
+   can't push the loop gain back up.
+3. **Escalation:** if four or more squeals happen within 5 s, the speaker is
+   too close for narrow cuts to help. The overall output is lowered in 6 dB
+   steps (down to -24 dB), you're told to move the mic or use headphones, and
+   the level recovers slowly once it's quiet.
+4. Cuts that haven't re-triggered for 45 s fade out, so the sound isn't
+   coloured permanently.
+
+**Measured** in a simulated speaker→room→mic loop (`tests/test_feedback.py`),
+plus open-loop false-alarm checks:
+
+| Case | Result |
+|---|---|
+| Moderate loops at 2.7 / 5 / 7.5 kHz | Howl ends 35 dB or more below the unguarded run |
+| Runaway howl, Normal sensitivity | Caught at -14 dBFS (unguarded it hits -1 dBFS) |
+| Extreme loop (gain 20×) | Howl ends at -94 dB, versus -4 dB unguarded |
+| False alarms: real speech, noisy speech, synthetic voice, a chord | None, even at High sensitivity |
+
+Try it without hardware: `python -m anc --simulate --simulate-feedback`, then
+pick the Spectral engine at 0 % reduction. That's the transparent setting, so
+the simulated loop really howls; the Neural engine already removes pure tones
+on its own.
+
 ## Measured performance
 
 These numbers come from this repo's own benchmarks: 4-core cloud x86 CPU,
@@ -207,6 +259,7 @@ in Balanced mode that's about 53 ms for Neural and about 27 ms for Spectral.
 | File | Contents |
 |---|---|
 | `anc/engines.py` | DeepFilterNet3 streaming ONNX (explicit GRU and ring-buffer state per 512-sample hop), the OM-LSA spectral engine, and Hybrid. Each engine has an exact, declared latency. |
+| `anc/feedback.py` | Feedback guard: howl detection (peak-to-neighbour and peak-to-harmonic ratios, persistence, pitch lock, growth), adaptive notches, ducking, escalation and release. |
 | `anc/autotune.py` | Learn & tune: noise-only selection, hum detection and notches, steadiness, the synthetic test voice, artifact (log-kurtosis) and voice (SI-SDR) scoring, and candidate selection. |
 | `anc/pipeline.py` | The processing chain, metrics, voice activity detection, profile application, capture, and background-drift monitoring. `process_offline()` runs the identical chain over a file. |
 | `anc/dsp.py` | FIFOs, delay lines, IIR filters, gate, AGC, limiter, and a streaming Kaiser-sinc resampler. The resampler measures 90–140 dB SNR, adds 16 samples of delay, and its ratio can vary, which is what the drift control uses. |
@@ -239,8 +292,9 @@ python -m anc.denoise noisy.wav clean.wav --engine neural --reduction 95 --clari
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                      # 49 tests: engines, latency, mixing math, resampling, clock drift, auto-tune, API
+pytest                      # 59 tests: engines, latency, mixing math, resampling, clock drift, auto-tune, feedback, API
 python -m anc --simulate    # runs the whole app with a synthetic noisy-voice source (no audio hardware)
+python -m anc --simulate --simulate-feedback   # ...plus a speaker-to-mic loop that howls at 4.8 kHz
 ```
 
 ### Troubleshooting

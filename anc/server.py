@@ -402,6 +402,8 @@ def create_app(simulate: bool = False, store: Store | None = None) -> FastAPI:
                         c.learn(float(msg.get("seconds", 5.0)))
                     elif op == "clear_profile":
                         c.clear_profile()
+                    elif op == "clear_feedback":
+                        c.send("clear_feedback")
                     elif op == "devices":
                         c.send("devices")
                     elif op == "reset":

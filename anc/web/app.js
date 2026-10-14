@@ -111,8 +111,37 @@
     if (t.clips > 0 && !S.clipWarned) { S.clipWarned = true; toast("Input is clipping – lower the input gain or your mic level", "warn"); }
     pushSpectrogram(t.spec_in, t.spec_out);
     if (t.capture != null && S.tune && S.tune.stage === "listening") renderListen(t.capture);
+    renderFeedback(t.feedback);
     $("#psDrift").textContent = t.drift_db == null ? "–" : `${t.drift_db.toFixed(1)} dB`;
     $("#psDrift").classList.toggle("bad", t.drift_db != null && t.drift_db > 4);
+  }
+
+  // --------------------------------------------------------- feedback guard
+  let fbEvents = null, fbSig = "", fbSafety = 0;
+  const fmtHz = (f) => (f >= 1000 ? (f / 1000).toFixed(2) + " kHz" : f.toFixed(0) + " Hz");
+  function renderFeedback(fb) {
+    S.fbNotches = fb ? fb.notches : [];
+    if (!fb) { fbEvents = null; return; }
+    if (fbEvents != null && fb.events > fbEvents && fb.last) {
+      toast(`Feedback squeal at ${fmtHz(fb.last.freq)} stopped: ${fb.last.depth.toFixed(0)} dB notch` +
+        (S.settings.agc_enabled ? ", auto gain paused" : ""), "warn");
+    }
+    fbEvents = fb.events;
+    if (fb.safety_db < fbSafety - 0.5) {
+      toast(`Strong feedback: output lowered ${(-fb.safety_db).toFixed(0)} dB. Move the mic away from the speaker or use headphones`, "err");
+    }
+    fbSafety = fb.safety_db;
+    const sig = fb.notches.map((n) => n.freq.toFixed(0) + ":" + n.depth.toFixed(0)).join(",") + "|" + fb.safety_db.toFixed(0);
+    if (sig === fbSig) return;
+    fbSig = sig;
+    const st = $(".fb-status");
+    st.classList.toggle("alert", fb.notches.length > 0);
+    $("#fbReset").hidden = !fb.notches.length && fb.safety_db > -0.5;
+    $("#fbText").textContent = fb.notches.length
+      ? `${fb.notches.length} feedback frequenc${fb.notches.length > 1 ? "ies" : "y"} notched · released after 45 s quiet`
+      : fb.events ? "No active feedback · earlier squeals resolved" : "Listening for feedback: none detected";
+    $("#fbChips").innerHTML = (fb.safety_db < -0.5 ? `<span class="chip fb">output −${(-fb.safety_db).toFixed(0)} dB (recovering)</span>` : "") +
+      fb.notches.map((n) => `<span class="chip fb">${fmtHz(n.freq)} · ${n.depth.toFixed(0)} dB</span>`).join("");
   }
 
   // ------------------------------------------------------------ learn & tune
@@ -446,6 +475,8 @@
     $("#bypassBtn").classList.toggle("on", !!s.bypass);
     $("#muteBtn").classList.toggle("on", !!s.mute_output);
     $$("#tuneStyle button").forEach((b) => b.classList.toggle("on", b.dataset.v === s.tune_style));
+    $$("#fbSens button").forEach((b) => b.classList.toggle("on", b.dataset.v === s.feedback_sensitivity));
+    $("#fbBox").classList.toggle("dim", s.feedback_guard === false);
     $("#topEngine").textContent = { neural: "Neural", hybrid: "Hybrid", spectral: "Spectral" }[s.engine] || "–";
     renderReduction(); renderState(); renderChannels(); feedbackHint();
   }
@@ -466,6 +497,8 @@
     $("#learnBtn2").addEventListener("click", startLearn);
     $("#clearProfile").addEventListener("click", () => { send("clear_profile"); toast("Noise profile cleared – back to adaptive tracking"); });
     $$("#tuneStyle button").forEach((b) => b.addEventListener("click", () => { set({ tune_style: b.dataset.v }); renderSettings(); }));
+    $$("#fbSens button").forEach((b) => b.addEventListener("click", () => { set({ feedback_sensitivity: b.dataset.v }); renderSettings(); }));
+    $("#fbReset").addEventListener("click", () => { send("clear_feedback"); toast("Feedback notches cleared"); });
     $("#tunerClose").addEventListener("click", closeTuner);
     $("#tunerDone").addEventListener("click", closeTuner);
     $("#tunerRetry").addEventListener("click", startLearn);
@@ -601,6 +634,13 @@
       return p;
     };
     const fillUnder = (p) => { const f = new Path2D(p); f.lineTo(padL + pw, 8 * d + ph); f.lineTo(padL, 8 * d + ph); f.closePath(); return f; };
+    (S.fbNotches || []).forEach((n, i) => {
+      const x = padL + fx(n.freq, pw);
+      ctx.save(); ctx.strokeStyle = "rgba(248,113,113,0.85)"; ctx.setLineDash([4 * d, 4 * d]); ctx.lineWidth = 1.2 * d;
+      ctx.beginPath(); ctx.moveTo(x, 8 * d); ctx.lineTo(x, 8 * d + ph); ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle = "#fecaca"; ctx.textAlign = x > padL + pw * 0.6 ? "right" : "left";
+      ctx.fillText(`feedback ${fmtHz(n.freq)} ${n.depth.toFixed(0)} dB`, x + (x > padL + pw * 0.6 ? -5 : 5) * d, (20 + i * 13) * d); ctx.restore();
+    });
     if (viz.specMode !== "out") {
       const p = path(disp.specIn);
       const g = ctx.createLinearGradient(0, 8 * d, 0, 8 * d + ph);

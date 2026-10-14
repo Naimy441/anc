@@ -391,3 +391,13 @@ kbd + kbd { margin-left: 0; }
 .profile-stats b.bad { color: var(--warn); }
 
 .group.first { border-top: 0; padding-top: 0; margin-bottom: 14px; }
+
+/* ---------- feedback guard ---------- */
+.fb-box { margin: -2px 0 12px; padding: 10px; border-radius: 12px; background: rgba(255,255,255,.025); border: 1px solid var(--card-b); transition: opacity .3s; }
+.fb-box.dim { opacity: .4; pointer-events: none; }
+.fb-status { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--muted); margin-top: 8px; }
+.fb-status.alert { color: #fde68a; }
+.ghost.tiny { padding: 3px 9px; font-size: 11px; }
+.chip.fb { background: rgba(248,113,113,.1); border-color: rgba(248,113,113,.35); color: #fecaca; animation: chipIn .4s var(--ease); }
+@keyframes chipIn { from { opacity: 0; transform: scale(.8); } }
+.toggle-row em { font-style: normal; font-size: 11px; }

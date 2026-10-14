@@ -183,6 +183,12 @@
 
       <details class="group" open>
         <summary><span>Voice processing</span></summary>
+        <div class="toggle-row"><span>Feedback guard <em class="muted">(stops squeal / howl)</em></span><label class="switch"><input type="checkbox" data-key="feedback_guard"><i></i></label></div>
+        <div class="fb-box" id="fbBox">
+          <div class="seg full small" id="fbSens"><button data-v="low">Low</button><button data-v="normal">Normal</button><button data-v="high">High</button></div>
+          <div class="fb-status"><span id="fbText">Listening for feedback: none detected</span><button class="ghost tiny" id="fbReset" type="button" hidden>Reset</button></div>
+          <div class="chips" id="fbChips"></div>
+        </div>
         <div class="toggle-row"><span>High-pass (rumble / hum)</span><label class="switch"><input type="checkbox" data-key="highpass_enabled"><i></i></label></div>
         <div class="slider" data-key="highpass_hz" data-min="20" data-max="400" data-step="5" data-unit="Hz" data-label="Cutoff" data-dep="highpass_enabled"></div>
         <div class="slider" data-key="clarity_db" data-min="0" data-max="9" data-step="0.5" data-unit="dB" data-label="Voice clarity"></div>

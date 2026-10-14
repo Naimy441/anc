@@ -32,6 +32,8 @@ SCHEMA: dict[str, tuple] = {
     "tune_style": (str, "balanced", ("gentle", "balanced", "max")),
     "auto_retune": (bool, True),
     "hum_notch_enabled": (bool, True),
+    "feedback_guard": (bool, True),
+    "feedback_sensitivity": (str, "normal", ("low", "normal", "high")),
     "noise_mode": (str, "adaptive", ("adaptive", "learned", "hybrid")),
     "latency_mode": (str, "balanced", ("ultra", "balanced", "safe")),
     "input_device": (object, None),

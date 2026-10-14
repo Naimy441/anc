@@ -17,6 +17,7 @@ import time
 import numpy as np
 
 from . import dsp
+from .feedback import FeedbackGuard
 from .engines import SAMPLE_RATE, Engine, HybridEngine, SpectralEngine, create_engine
 
 RATE = SAMPLE_RATE
@@ -82,6 +83,7 @@ class Pipeline:
         self.gate = dsp.NoiseGate(RATE, self.block)
         self.agc = dsp.Agc(RATE, self.block)
         self.limiter = dsp.Limiter(RATE, self.block)
+        self.guard = FeedbackGuard(RATE, self.block)
         self.in_gain = dsp.SmoothedParam(1.0, 30, br)
         self.out_gain = dsp.SmoothedParam(1.0, 30, br)
         self.wet = dsp.SmoothedParam(1.0, 40, br)
@@ -104,6 +106,7 @@ class Pipeline:
         self._vad_floor: float | None = None
         self._vad = 0.0
         self._pending: dict | None = None
+        self._guard_reset = False
         # learned noise profile / capture / drift monitoring
         self.profile: dict | None = None
         self._pending_profile = _UNSET
@@ -130,6 +133,10 @@ class Pipeline:
     @property
     def latency(self) -> int:
         return self.engine.latency
+
+    def request_guard_reset(self) -> None:
+        """Thread-safe: drop all feedback notches at the next block."""
+        self._guard_reset = True
 
     def request_settings(self, s: dict) -> None:
         """Thread-safe: queue new settings; the audio thread applies them at the next
@@ -160,6 +167,7 @@ class Pipeline:
                             float(s.get("gate_range_db", 30.0)))
         self.agc.target_db = float(s.get("agc_target_db", -20.0))
         self.limiter.ceiling = dsp.db_to_lin(float(s.get("limiter_ceiling_db", -1.0)))
+        self.guard.configure(s.get("feedback_sensitivity", "normal"))
         self.engine.configure(s)
         if self.profile is not None and (
                 float(s.get("input_gain_db", 0.0)) != self._profile_gain_db
@@ -292,6 +300,9 @@ class Pipeline:
         if pending is not None:
             self._pending = None
             self.apply_settings(pending)
+        if self._guard_reset:
+            self._guard_reset = False
+            self.guard.reset()
         prof = self._pending_profile
         if prof is not _UNSET:
             self._pending_profile = _UNSET
@@ -332,6 +343,10 @@ class Pipeline:
             y = self.gate.process(y)
             voice = self.gate.open
         if s.get("agc_enabled"):
+            if self.guard.agc_frozen:
+                # Feedback just happened: never let the AGC push loop gain back up.
+                self.agc.gain_db = min(self.agc.gain_db, 0.0)
+                voice = False
             y = self.agc.process(y, voice)
         y = y * self.out_gain.next_ramp(len(y))
         if s.get("limiter_enabled", True):
@@ -343,6 +358,9 @@ class Pipeline:
             y = y + bp * (ref - y)
         else:
             self.dry_for_bypass.process(raw)
+
+        if s.get("feedback_guard", True):
+            y = self.guard.process(y)
 
         if s.get("mute_output"):
             out = np.zeros_like(y)

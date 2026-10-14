@@ -70,6 +70,14 @@ class SimStream:
         self._n = 0
         self._rng = np.random.default_rng(1)
         self.last_out = None
+        # --simulate-feedback: route the output back into the "mic" through a
+        # 4.8 kHz room resonance with loop gain > 1 (a speaker next to a mic).
+        self.feedback = os.environ.get("ANC_SIM_FEEDBACK") == "1"
+        if self.feedback:
+            from scipy.signal import iirpeak
+
+            b, a = iirpeak(4800.0, 8.0, fs=samplerate)
+            self._fb = (b * 1.6, a, np.zeros(2))
 
     def _signal(self, n):
         t = (self._n + np.arange(n)) / self.samplerate
@@ -89,6 +97,13 @@ class SimStream:
         nxt = time.perf_counter()
         while self.active:
             x = self._signal(self.blocksize)
+            if self.feedback and self.last_out is not None:
+                from scipy.signal import lfilter
+
+                b, a, zi = self._fb
+                fb, zi = lfilter(b, a, self.last_out[:, 0], zi=zi)
+                self._fb = (b, a, zi)
+                x = (x + fb).astype(np.float32)
             inp = np.repeat(x[:, None], self.channels[0], axis=1)
             out = np.zeros((self.blocksize, self.channels[1]), dtype=np.float32)
             self.callback(inp, out, self.blocksize, None, 0)
@@ -549,6 +564,8 @@ class AudioWorker:
             "profile": self.profile is not None,
             "drift_db": round(p.m_drift_db, 2) if self.profile is not None else None,
             "quiet_s": round(p.quiet_seconds, 1),
+            "feedback": {"notches": p.guard.active(), "events": p.guard.events,
+                         "last": p.guard.last_event, "safety_db": round(p.guard.safety_db, 1)} if self.settings.get("feedback_guard", True) else None,
         }
 
     # ------------------------------------------------------------------ loop
@@ -573,6 +590,9 @@ class AudioWorker:
                 self.send("error", "Activate processing first, then learn the noise")
                 self.send("tune", {"stage": "error", "error": "not running"})
             self.send("state", self.state())
+        elif cmd == "clear_feedback":
+            if self.pipe is not None:
+                self.pipe.request_guard_reset()
         elif cmd == "profile":
             self.profile = payload
             if self.pipe is not None:
