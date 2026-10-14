@@ -17,7 +17,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSock
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import __version__
+from . import __version__, autotune
 from .audio import worker_main
 from .config import DEFAULTS, PRESETS, SCHEMA, Store, apply_preset, validate
 from .engines import ENGINES, SAMPLE_RATE
@@ -41,6 +41,11 @@ class Controller:
         self.send_lock = threading.Lock()
         self.want_running = False
         self._closing = False
+        self.profile: dict | None = self.store.load_profile()
+        self.tuning = False
+        self._tune_lock = threading.Lock()
+        self._tune_neural = None
+        self.last_tune: dict | None = None
         self._spawn()
 
     # ------------------------------------------------------------ process mgmt
@@ -52,6 +57,7 @@ class Controller:
         self.proc.start()
         child.close()
         self.send("settings", self.settings)
+        self.send("profile", self.profile)
         self.reader = threading.Thread(target=self._read, daemon=True, name="anc-reader")
         self.reader.start()
 
@@ -70,6 +76,10 @@ class Controller:
                 self.devices = payload
             elif kind == "log":
                 print(payload, flush=True)
+                continue
+            elif kind == "captured":
+                threading.Thread(target=self._tune, args=(payload,), daemon=True,
+                                 name="anc-tune").start()
                 continue
             self._emit({"type": kind, **({"data": payload})})
         if self._closing:
@@ -126,6 +136,67 @@ class Controller:
         self.want_running = True
         self.send("start", self.settings)
 
+    # ------------------------------------------------------------ learn & tune
+    def learn(self, seconds: float = 5.0) -> bool:
+        """Start a guided capture of the background noise (auto-starts processing)."""
+        if self.tuning:
+            return False
+        if not self.state.get("running"):
+            self.start()
+        self.send("capture", max(2.0, min(15.0, float(seconds))))
+        self._emit({"type": "tune", "data": {"stage": "listening", "seconds": seconds,
+                                             "reason": "user"}})
+        return True
+
+    def clear_profile(self) -> None:
+        self.profile = None
+        self.store.save_profile(None)
+        self.send("profile", None)
+        self._commit(validate({"noise_mode": "adaptive"}, self.settings))
+        self._emit({"type": "profile", "data": None})
+
+    def _tune(self, payload: dict) -> None:
+        reason = payload.get("reason", "user")
+        if not self._tune_lock.acquire(blocking=False):
+            return
+        self.tuning = True
+        try:
+            def progress(m):
+                self._emit({"type": "tune", "data": {**m, "reason": reason}})
+
+            progress({"stage": "analyzing", "progress": 0.02})
+            if self._tune_neural is None:
+                from .engines import DeepFilterNetEngine
+
+                self._tune_neural = DeepFilterNetEngine()
+            engine = self.settings.get("engine", "neural")
+            # Background re-tunes stay within the running engine (no stream restart).
+            families = None if reason == "user" else [engine]
+            prof = autotune.analyze(np.asarray(payload["audio"], dtype=np.float32),
+                                    style=self.settings.get("tune_style", "balanced"),
+                                    families=families, settings=self.settings,
+                                    progress=progress, neural=self._tune_neural)
+            prof["input_gain_db"] = float(payload.get("input_gain_db", 0.0))
+            prof["source"] = reason
+            self.profile = prof
+            self.store.save_profile(prof)
+            self.send("profile", prof)
+            upd = dict(prof["settings"])
+            if reason != "user":
+                upd.pop("engine", None)
+            upd["noise_mode"] = "learned"
+            new = validate(upd, self.settings)
+            new["preset"] = "custom"
+            self._commit(new)
+            self.last_tune = profile_summary(prof)
+            self._emit({"type": "profile", "data": self.last_tune})
+        except Exception as e:  # never let a tuning failure take the server down
+            self._emit({"type": "tune", "data": {"stage": "error", "error": str(e),
+                                                 "reason": reason}})
+        finally:
+            self.tuning = False
+            self._tune_lock.release()
+
     def stop(self) -> None:
         self.want_running = False
         self.send("stop")
@@ -138,8 +209,16 @@ class Controller:
             "devices": self.devices,
             "presets": {k: v["label"] for k, v in PRESETS.items()},
             "engines": ENGINES,
+            "profile": profile_summary(self.profile),
             "schema": {k: list(v[1:]) if v[0] is not object else [None] for k, v in SCHEMA.items()},
         }
+
+
+def profile_summary(p: dict | None) -> dict | None:
+    """Profile without the raw PSD arrays (what the UI needs)."""
+    if p is None:
+        return None
+    return {k: v for k, v in p.items() if k not in ("psd_raw", "psd_post")}
 
 
 class Listener:
@@ -218,13 +297,19 @@ def create_app(simulate: bool = False, store: Store | None = None) -> FastAPI:
         return {"ok": True}
 
     @app.post("/api/learn")
-    async def post_learn(seconds: float = 2.0):
-        ctl().send("learn", max(0.5, min(10.0, seconds)))
+    async def post_learn(seconds: float = 5.0):
+        """Learn the background noise for ``seconds`` (stay quiet), then auto-tune."""
+        if not ctl().learn(seconds):
+            raise HTTPException(409, "A tuning run is already in progress")
         return {"ok": True}
 
-    @app.post("/api/clear-learned")
-    async def post_clear():
-        ctl().send("clear_learned")
+    @app.get("/api/profile")
+    async def get_profile():
+        return profile_summary(ctl().profile)
+
+    @app.delete("/api/profile")
+    async def delete_profile():
+        ctl().clear_profile()
         return {"ok": True}
 
     @app.get("/api/devices")
@@ -314,9 +399,9 @@ def create_app(simulate: bool = False, store: Store | None = None) -> FastAPI:
                     elif op == "preset":
                         c.preset(str(msg.get("name")))
                     elif op == "learn":
-                        c.send("learn", float(msg.get("seconds", 2.0)))
-                    elif op == "clear_learned":
-                        c.send("clear_learned")
+                        c.learn(float(msg.get("seconds", 5.0)))
+                    elif op == "clear_profile":
+                        c.clear_profile()
                     elif op == "devices":
                         c.send("devices")
                     elif op == "reset":

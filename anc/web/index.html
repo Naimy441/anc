@@ -72,8 +72,8 @@
         <button class="qbtn" id="muteBtn" title="Mute processed output (M)">
           <svg viewBox="0 0 24 24"><path d="M5 9v6h4l5 4V5L9 9H5z"/><path class="mute-x" d="M17 9l4 6M21 9l-4 6"/></svg><span>Mute</span>
         </button>
-        <button class="qbtn" id="learnBtn" title="Capture a noise-only profile (Spectral / Hybrid)">
-          <svg viewBox="0 0 24 24"><path d="M3 12h3l3-7 4 14 3-7h5"/></svg><span>Learn noise</span>
+        <button class="qbtn tune-btn" id="learnBtn" title="Listen to the room, then find the strongest clean setting">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3.5"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg><span>Learn &amp; tune</span>
         </button>
       </div>
 
@@ -121,6 +121,38 @@
       <div class="card-head"><h2>Presets</h2></div>
       <div class="presets" id="presets"></div>
 
+      <details class="group first" id="profileGroup" open>
+        <summary><span>Noise profile</span><em class="badge" id="profileBadge">not learned</em></summary>
+        <div class="profile-card" id="profileCard">
+          <canvas id="profileCanvas"></canvas>
+          <div class="profile-meta" id="profileMeta">No profile yet. Press <b>Learn &amp; tune</b> and stay quiet for 5 seconds: ANC measures the background, then tests dozens of settings to find the strongest one that adds no artifacts.</div>
+        </div>
+        <div class="profile-stats" id="profileStats" hidden>
+          <div><label>Removes</label><b id="psRemoval">–</b></div>
+          <div><label>Artifacts</label><b id="psArtifact">–</b></div>
+          <div><label>Drift</label><b id="psDrift">–</b></div>
+        </div>
+        <div class="btn-row">
+          <button class="primary" id="learnBtn2" type="button">Learn &amp; tune</button>
+          <button class="ghost" id="clearProfile" type="button">Clear</button>
+        </div>
+        <div class="field"><span>Tuning style</span>
+          <div class="seg full" id="tuneStyle"><button data-v="gentle">Gentle</button><button data-v="balanced">Balanced</button><button data-v="max">Max</button></div>
+        </div>
+        <div class="toggle-row"><span>Auto re-tune when the noise changes</span><label class="switch"><input type="checkbox" data-key="auto_retune"><i></i></label></div>
+        <div class="toggle-row"><span>Hum notch filters</span><label class="switch"><input type="checkbox" data-key="hum_notch_enabled"><i></i></label></div>
+        <details class="sub-group">
+          <summary>Advanced tuning</summary>
+          <label class="field"><span>Noise model</span>
+            <select data-key="noise_mode"><option value="adaptive">Adaptive tracking</option><option value="learned">Learned profile (auto-drifting)</option><option value="hybrid">Adaptive + learned floor</option></select></label>
+          <div class="slider" data-key="spectral_aggressiveness" data-min="0.5" data-max="3" data-step="0.05" data-unit="×" data-label="Spectral over-subtraction"></div>
+          <div class="slider" data-key="spectral_floor_db" data-min="-60" data-max="-6" data-step="1" data-unit="dB" data-label="Spectral gain floor"></div>
+          <div class="slider" data-key="post_aggressiveness" data-min="0.5" data-max="3" data-step="0.05" data-unit="×" data-label="Hybrid residual over-subtraction"></div>
+          <div class="slider" data-key="post_floor_db" data-min="-40" data-max="-6" data-step="1" data-unit="dB" data-label="Hybrid residual floor"></div>
+          <div class="slider" data-key="spectral_smoothing" data-min="0.8" data-max="0.995" data-step="0.005" data-unit="" data-label="SNR smoothing (anti-musical-noise)"></div>
+        </details>
+      </details>
+
       <div class="card-head"><h2>Engine</h2></div>
       <div class="engines" id="engines">
         <button data-engine="neural"><b>Neural</b><span>DeepFilterNet3 · 48 kHz full-band</span><em>32 ms</em></button>
@@ -138,6 +170,7 @@
           <label class="field"><span>Buffering</span>
             <select data-key="latency_mode"><option value="ultra">Ultra-low</option><option value="balanced">Balanced</option><option value="safe">Safe</option></select></label>
         </div>
+        <p class="hint warn" id="btHint" hidden>This input runs at <b id="btRate"></b>, which usually means Bluetooth earbuds in headset mode. Voices will sound band-limited. Wired earbuds or a separate mic give better quality.</p>
         <p class="hint" id="deviceHint">Use headphones when monitoring to avoid feedback. To use the cleaned mic in Zoom/Discord/OBS, pick a virtual cable (BlackHole, VB-CABLE, PipeWire null sink) as output.</p>
       </details>
 
@@ -160,15 +193,6 @@
         <div class="slider" data-key="agc_target_db" data-min="-36" data-max="-10" data-step="1" data-unit="dBFS" data-label="Target level" data-dep="agc_enabled"></div>
         <div class="toggle-row"><span>Output limiter</span><label class="switch"><input type="checkbox" data-key="limiter_enabled"><i></i></label></div>
         <div class="slider" data-key="limiter_ceiling_db" data-min="-12" data-max="0" data-step="0.5" data-unit="dBFS" data-label="Ceiling" data-dep="limiter_enabled"></div>
-      </details>
-
-      <details class="group" id="spectralGroup">
-        <summary><span>Spectral tuning</span><em class="badge">Spectral · Hybrid</em></summary>
-        <div class="slider" data-key="spectral_aggressiveness" data-min="0.5" data-max="3" data-step="0.05" data-unit="×" data-label="Aggressiveness"></div>
-        <div class="slider" data-key="spectral_smoothing" data-min="0.8" data-max="0.995" data-step="0.005" data-unit="" data-label="Smoothing (anti-musical-noise)"></div>
-        <label class="field"><span>Noise model</span>
-          <select data-key="noise_mode"><option value="adaptive">Adaptive tracking</option><option value="learned">Learned profile (frozen)</option><option value="hybrid">Adaptive + learned floor</option></select></label>
-        <div class="learn-row"><span id="learnStatus">No profile captured</span><button class="ghost" id="clearLearned" type="button">Clear</button></div>
       </details>
 
       <div class="reset-row"><button class="ghost" id="resetBtn" type="button">Reset to defaults</button></div>
@@ -202,6 +226,56 @@
     </div>
     <div class="keys"><kbd>Space</kbd> on/off <kbd>B</kbd> bypass <kbd>M</kbd> mute <kbd>↑</kbd><kbd>↓</kbd> reduction</div>
   </footer>
+
+  <div class="tuner" id="tuner" hidden>
+    <div class="tuner-card" role="dialog" aria-modal="true" aria-labelledby="tunerTitle">
+      <button class="tuner-x" id="tunerClose" aria-label="Close">×</button>
+      <div class="tuner-steps"><span data-s="listening">Listen</span><i></i><span data-s="tuning">Tune</span><i></i><span data-s="result">Result</span></div>
+
+      <div class="tstage" data-stage="listening">
+        <div class="listen-ring">
+          <svg viewBox="0 0 200 200"><circle class="lr-track" cx="100" cy="100" r="88"/><circle class="lr-val" id="listenArc" cx="100" cy="100" r="88"/></svg>
+          <canvas id="listenCanvas"></canvas>
+          <div class="lr-center"><b id="listenCount">5</b><span>seconds</span></div>
+        </div>
+        <h3 id="tunerTitle">Stay quiet: learning your room</h3>
+        <p class="muted">Let the fan, AC or hum run as usual. Don't talk; short sounds are ignored automatically.</p>
+      </div>
+
+      <div class="tstage" data-stage="tuning">
+        <h3>Finding the strongest clean setting</h3>
+        <p class="muted" id="tuneStageText">Analyzing the noise…</p>
+        <div class="tune-bar"><i id="tuneBar"></i></div>
+      </div>
+
+      <div class="tstage" data-stage="result">
+        <div class="result-head">
+          <div><h3 id="resultTitle">Steady noise</h3><div class="chips" id="resultChips"></div></div>
+        </div>
+        <div class="result-tiles">
+          <div class="tile accent"><label>Noise removed</label><b><span id="rRemoval">–</span><small> dB</small></b></div>
+          <div class="tile"><label>Added artifacts</label><b id="rArtifact">–</b></div>
+          <div class="tile"><label>Voice quality</label><b id="rVoice">–</b></div>
+        </div>
+        <p class="result-choice" id="resultChoice"></p>
+      </div>
+
+      <div class="tstage" data-stage="error">
+        <h3>Tuning didn't finish</h3>
+        <p class="muted" id="tuneError"></p>
+      </div>
+
+      <div class="scatter-wrap" id="scatterWrap">
+        <canvas id="scatter"></canvas>
+        <div class="scatter-legend"><span class="sl spectral"></span>Spectral <span class="sl neural"></span>Neural <span class="sl hybrid"></span>Hybrid <span class="sl rej"></span>Rejected (artifacts / voice damage)</div>
+      </div>
+
+      <div class="tuner-actions">
+        <button class="ghost" id="tunerRetry" type="button">Learn again</button>
+        <button class="primary" id="tunerDone" type="button">Done</button>
+      </div>
+    </div>
+  </div>
 
   <div class="toasts" id="toasts"></div>
   <script src="/static/app.js"></script>

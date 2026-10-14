@@ -11,6 +11,11 @@ web UI on `localhost`.
   exactly. *X %* removes *X %* of the noise amplitude, so 90 % = 20 dB and
   99 % = 40 dB. Wet and dry signals are mixed sample-aligned, so there is no
   phasing at any setting.
+- **Learn & tune:** stay quiet for 5 seconds while it listens to your room (a fan,
+  AC or hum). It then tests 42 configurations on noise it didn't train on and
+  applies the one that removes the most noise **without adding artifacts or
+  damaging your voice**. It also notches out any hum, and re-tunes itself in the
+  background if the noise changes. See [Learn & tune](#learn--tune).
 - **Three engines:** Neural, Hybrid (neural plus a statistical residual
   suppressor) and Spectral (classic OM-LSA, 16 ms latency, very little CPU).
 - **Full voice chain:** high-pass, voice clarity EQ, residual noise gate, AGC,
@@ -88,13 +93,13 @@ microphone in the other app:
 | **Engine** | **Neural**: DeepFilterNet3, best quality, 32 ms. **Hybrid**: Neural plus an OM-LSA residual suppressor, the deepest suppression, 48 ms. **Spectral**: OM-LSA with MMSE/SPP noise tracking, 16 ms, minimal CPU, best for steady noise. |
 | **Bypass** (B) | A/B against the raw input. The comparison is latency-aligned and crossfaded, so it's click-free. |
 | **Mute** (M) | Silences the output while processing and metering continue. |
-| **Learn noise** | Spectral and Hybrid only. Stay quiet for 2.5 s to capture a noise profile, then choose *Noise model → Learned* or *Adaptive + learned floor*. |
+| **Learn & tune** | Listens for 5 s, then finds and applies the best setup for your background. See below. |
 | **High-pass** | Removes rumble, hum and handling noise (default 80 Hz, 4th-order Butterworth). |
 | **Voice clarity** | Presence peak at 3.2 kHz plus a gentle air shelf. |
 | **Residual noise gate** | Expander with hysteresis and hold. It closes on what little is left between words. |
 | **Auto gain (AGC)** | Slowly levels your voice to a target loudness. It only adapts while you are speaking. |
 | **Output limiter** | Instant attack, smooth release, plus a soft clipper. The output never clips. |
-| **Spectral tuning** | Aggressiveness (noise over-estimation) and a-priori SNR smoothing (less musical noise). |
+| **Noise profile panel** | The learned spectrum with hum markers, what it removes, live *drift* (how far the current background is from the learned one), tuning style (Gentle / Balanced / Max), auto re-tune, hum notches, and advanced manual tuning. |
 | **Buffering** | Ultra-low, Balanced or Safe. Use Safe if you hear crackles. |
 | **Presets** | Voice call, Natural, Maximum, Low latency. |
 
@@ -104,6 +109,61 @@ activity, DSP load, end-to-end latency, and dropout and clipping counters. Setti
 persist in `~/.anc/settings.json`.
 
 ---
+
+## Learn & tune
+
+This is built for **constant noise**: fans, AC, computer hum, fridges, road rumble
+through a window.
+
+1. **Listen (5 s).** Press **Learn & tune** and stay quiet; the fan keeps running.
+   Any louder moment, such as a cough, a word or a click, is detected and left
+   out, so only the background is learned. Earbud mics work too.
+2. **Analyze.**
+   - **Hum detection:** finds steady narrow tones such as a fan's blade-pass hum
+     or mains hum, with sub-hertz accuracy, and designs notch filters for them.
+   - **Steadiness:** measures how steady the noise is and labels it *steady*,
+     *mildly fluctuating* or *changing*.
+3. **Tune.** The capture is split in half: one half trains the profile, the other
+   is unseen test noise. A synthetic test voice is mixed in at 5 dB SNR. Every
+   candidate then runs through the **actual runtime engines**:
+   - 24 Spectral settings (OM-LSA with your learned profile: over-subtraction × gain floor),
+   - 6 Neural strengths (DeepFilterNet3),
+   - 12 Hybrid settings (DeepFilterNet3 plus a residual filter trained on what
+     the network leaves behind).
+
+   Each candidate is scored on three things:
+   - **Noise removed** (dB) on the unseen noise.
+   - **Added artifacts:** the log-kurtosis ratio of the leftover noise's
+     spectrum, the standard measure of "musical noise". 0 means the leftover is
+     just a quieter copy of the original noise.
+   - **Voice quality:** SI-SDR of the processed test voice.
+4. **Pick and apply.**
+   - Candidates with artifacts above the style's limit, or voice quality more
+     than the style's tolerance below the best, are rejected.
+   - Of the rest, the one that removes the most wins. If two are within 1 dB,
+     the lower-latency one wins.
+   - The choice is applied immediately. The results screen plots every
+     candidate: noise removed against voice quality.
+5. **Stay tuned.**
+   - The learned profile slowly follows small changes during speech pauses.
+   - The background is fingerprinted continuously, in 24 bands, during pauses.
+   - If it drifts by more than 4 dB for 2 s (fan switched to high, AC kicks in),
+     ANC re-tunes automatically from recent noise-only audio. This stays within
+     the current engine, so there's no audio glitch.
+
+| Style | Artifact limit | Voice-quality tolerance | Use when |
+|---|---|---|---|
+| Gentle | 0.15 | 0.5 dB | Music, podcasts, maximum naturalness |
+| Balanced | 0.35 | 1.5 dB | Calls and recordings (default) |
+| Max | 0.7 | 3 dB | Very loud fans, where removal matters most |
+
+The profile is saved to `~/.anc/profile.json` and reloaded at the next start. If
+you change the input gain, the profile is rescaled automatically.
+
+> **Earbud tip:** Bluetooth earbuds switch to "headset mode" when their mic is
+> in use, usually 16 kHz mono. ANC detects this and warns you. It still works
+> well for fan noise, but voices sound band-limited, so wired earbuds or a
+> separate mic sound better.
 
 ## Measured performance
 
@@ -147,7 +207,8 @@ in Balanced mode that's about 53 ms for Neural and about 27 ms for Spectral.
 | File | Contents |
 |---|---|
 | `anc/engines.py` | DeepFilterNet3 streaming ONNX (explicit GRU and ring-buffer state per 512-sample hop), the OM-LSA spectral engine, and Hybrid. Each engine has an exact, declared latency. |
-| `anc/pipeline.py` | The processing chain, metrics and voice activity detection. `process_offline()` runs the identical chain over a file. |
+| `anc/autotune.py` | Learn & tune: noise-only selection, hum detection and notches, steadiness, the synthetic test voice, artifact (log-kurtosis) and voice (SI-SDR) scoring, and candidate selection. |
+| `anc/pipeline.py` | The processing chain, metrics, voice activity detection, profile application, capture, and background-drift monitoring. `process_offline()` runs the identical chain over a file. |
 | `anc/dsp.py` | FIFOs, delay lines, IIR filters, gate, AGC, limiter, and a streaming Kaiser-sinc resampler. The resampler measures 90–140 dB SNR, adds 16 samples of delay, and its ratio can vary, which is what the drift control uses. |
 | `anc/audio.py` | Device negotiation (48 kHz → native rate → split streams, WASAPI auto-convert), callbacks, drift compensation, telemetry. |
 | `anc/server.py`, `anc/config.py` | API, WebSocket, presets, validation. |
@@ -160,7 +221,8 @@ in Balanced mode that's about 53 ms for Neural and about 27 ms for Spectral.
 | `POST /api/settings` | Partial update, e.g. `{"reduction": 85, "engine": "hybrid"}`. |
 | `POST /api/start` / `POST /api/stop` | Start or stop processing. |
 | `POST /api/preset/{voice_call\|studio\|max\|low_latency}` | Apply a preset. |
-| `POST /api/learn?seconds=2.5` / `POST /api/clear-learned` | Capture or clear a noise profile. |
+| `POST /api/learn?seconds=5` | Learn the background and auto-tune. Progress arrives on the WebSocket as `tune` events, the result as a `profile` event. |
+| `GET /api/profile` / `DELETE /api/profile` | Read or clear the learned profile. |
 | `GET /api/devices?refresh=1` | List devices, rescanning first if asked. |
 | `POST /api/process` | Upload an audio file (multipart field `file`) and get back the denoised WAV. |
 | `WS /ws` | Live telemetry and state. Send `{"op": "set", "values": {...}}`, `{"op": "start"}`, and so on. |
@@ -177,7 +239,7 @@ python -m anc.denoise noisy.wav clean.wav --engine neural --reduction 95 --clari
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                      # 36 tests: engines, latency alignment, mixing math, resampling, drift, API
+pytest                      # 49 tests: engines, latency, mixing math, resampling, clock drift, auto-tune, API
 python -m anc --simulate    # runs the whole app with a synthetic noisy-voice source (no audio hardware)
 ```
 

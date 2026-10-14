@@ -17,9 +17,13 @@ import time
 import numpy as np
 
 from . import dsp
-from .engines import SAMPLE_RATE, Engine, create_engine
+from .engines import SAMPLE_RATE, Engine, HybridEngine, SpectralEngine, create_engine
 
 RATE = SAMPLE_RATE
+DRIFT_DB = 4.0          # background change that triggers an automatic re-tune
+QUIET_VAD = 0.15        # voice-activity level below which a block counts as noise-only
+QUIET_SECONDS = 6.0     # rolling store of recent noise-only audio (for re-tuning)
+_UNSET = object()
 
 
 def reduction_to_atten_db(pct: float) -> float:
@@ -71,7 +75,9 @@ class Pipeline:
         L = self.engine.latency
         self.dry_for_mix = dsp.DelayLine(L)
         self.dry_for_bypass = dsp.DelayLine(L)
+        self.dry_pre_notch = dsp.DelayLine(L)
         self.hpf = dsp.SosFilter(None)
+        self.notch = dsp.SosFilter(None)
         self.clarity = dsp.SosFilter(None)
         self.gate = dsp.NoiseGate(RATE, self.block)
         self.agc = dsp.Agc(RATE, self.block)
@@ -95,9 +101,26 @@ class Pipeline:
         self.m_clip = 0
         self.m_voice = 0.0
         self._removed_smooth = 0.0
-        self._vad_floor = -60.0
+        self._vad_floor: float | None = None
         self._vad = 0.0
         self._pending: dict | None = None
+        # learned noise profile / capture / drift monitoring
+        self.profile: dict | None = None
+        self._pending_profile = _UNSET
+        self._profile_gain_db = 0.0
+        self._ref_bands = None
+        self._notch_on = None
+        self._cap = None
+        self._cap_pos = 0
+        self._quiet = np.zeros(int(QUIET_SECONDS * RATE), dtype=np.float32)
+        self._quiet_pos = 0
+        self._quiet_fill = 0
+        self._pre_hist = np.zeros(dsp.BAND_FFT, dtype=np.float32)
+        self._qband = None
+        self._quiet_since_profile = 0.0
+        self._drift_over = 0.0
+        self.m_drift_db = 0.0
+        self.stale = False
         self.apply_settings(settings)
         self.bypass_mix.snap(1.0 if settings.get("bypass") else 0.0)
         self.wet.snap(self.wet.target)
@@ -138,6 +161,108 @@ class Pipeline:
         self.agc.target_db = float(s.get("agc_target_db", -20.0))
         self.limiter.ceiling = dsp.db_to_lin(float(s.get("limiter_ceiling_db", -1.0)))
         self.engine.configure(s)
+        if self.profile is not None and (
+                float(s.get("input_gain_db", 0.0)) != self._profile_gain_db
+                or bool(s.get("hum_notch_enabled", True)) != self._notch_on):
+            self._apply_profile()
+
+    # ------------------------------------------------------------ noise profile
+    def request_profile(self, profile: dict | None) -> None:
+        """Thread-safe: install a learned noise profile at the next block boundary."""
+        self._pending_profile = profile
+
+    def set_profile(self, profile: dict | None) -> None:
+        self.profile = profile
+        self._qband = None
+        self._quiet_since_profile = 0.0
+        self._drift_over = 0.0
+        self.m_drift_db = 0.0
+        self.stale = False
+        self._ref_bands = np.asarray(profile["bands_db"]) if profile else None
+        self._apply_profile()
+
+    def _apply_profile(self) -> None:
+        p = self.profile
+        s = self.settings
+        gain_db = float(s.get("input_gain_db", 0.0))
+        self._profile_gain_db = gain_db
+        self._notch_on = bool(s.get("hum_notch_enabled", True))
+        if p is None:
+            self.notch.set(None)
+            self._set_learned(None, None)
+            return
+        from .autotune import notch_sos
+
+        self.notch.set(notch_sos(p.get("tones") or []) if self._notch_on else None)
+        # The profile was measured at the capture-time input gain; rescale to now.
+        scale = 10 ** ((gain_db - float(p.get("input_gain_db", 0.0))) / 10.0)
+        raw = np.asarray(p["psd_raw"], dtype=np.float64) * scale
+        post = p.get("psd_post")
+        post = np.asarray(post, dtype=np.float64) * scale if post is not None else None
+        self._set_learned(raw, post)
+
+    def _set_learned(self, raw, post) -> None:
+        eng = self.engine
+        if isinstance(eng, SpectralEngine):
+            eng.learned = raw
+        elif isinstance(eng, HybridEngine):
+            eng.post.learned = post
+
+    def start_capture(self, seconds: float) -> None:
+        """Record ``seconds`` of conditioned input (after high-pass, before notches)."""
+        self._cap_pos = 0
+        self._cap = np.zeros(int(seconds * RATE), dtype=np.float32)
+
+    @property
+    def capture_progress(self) -> float | None:
+        cap = self._cap
+        return None if cap is None else min(1.0, self._cap_pos / len(cap))
+
+    def take_capture(self) -> np.ndarray | None:
+        cap = self._cap
+        if cap is None or self._cap_pos < len(cap):
+            return None
+        self._cap = None
+        return cap
+
+    @property
+    def quiet_seconds(self) -> float:
+        return self._quiet_fill / RATE
+
+    def take_quiet(self, seconds: float) -> np.ndarray:
+        """Most recent noise-only audio (speech pauses), oldest first."""
+        n = min(int(seconds * RATE), self._quiet_fill)
+        idx = (np.arange(self._quiet_pos - n, self._quiet_pos)) % len(self._quiet)
+        self._quiet_fill = 0
+        return self._quiet[idx].copy()
+
+    def _track_quiet(self, pre: np.ndarray) -> None:
+        """Store noise-only audio and watch the background for changes."""
+        n = len(pre)
+        q = self._quiet
+        p = self._quiet_pos
+        end = p + n
+        if end <= len(q):
+            q[p:end] = pre
+        else:
+            k = len(q) - p
+            q[p:] = pre[:k]
+            q[: n - k] = pre[k:]
+        self._quiet_pos = end % len(q)
+        self._quiet_fill = min(len(q), self._quiet_fill + n)
+        if self._ref_bands is None:
+            return
+        bp = dsp.band_power(self._pre_hist)
+        self._qband = bp if self._qband is None else self._qband + 0.02 * (bp - self._qband)
+        self._quiet_since_profile += n / RATE
+        if self._quiet_since_profile < 1.5:
+            return
+        offset = self._profile_gain_db - float(self.profile.get("input_gain_db", 0.0))
+        diff = 10 * np.log10(self._qband + 1e-20) - (self._ref_bands + offset)
+        self.m_drift_db = float(np.mean(np.abs(diff)))
+        self._drift_over = self._drift_over + n / RATE if self.m_drift_db > DRIFT_DB else 0.0
+        if self._drift_over > 2.0:
+            self.stale = True
 
     def _detect_voice(self, enhanced: np.ndarray) -> bool:
         """Energy VAD on the *denoised* signal against an adaptive floor.
@@ -145,10 +270,14 @@ class Pipeline:
         After suppression the background is far below speech, so a minimum-tracking
         floor + ~12 dB margin is a robust, cheap speech detector."""
         db = 10.0 * math.log10(float(np.dot(enhanced, enhanced)) / len(enhanced) + 1e-12)
-        if db < self._vad_floor:
-            self._vad_floor = 0.6 * self._vad_floor + 0.4 * db
-        else:
-            self._vad_floor += 2.0 / self.block_rate  # floor creeps up ~2 dB/s
+        if db > -95.0:  # ignore digital silence (engine start-up, muted input)
+            if self._vad_floor is None or db < self._vad_floor:
+                self._vad_floor = db if self._vad_floor is None else 0.6 * self._vad_floor + 0.4 * db
+            else:
+                self._vad_floor += 3.0 / self.block_rate  # floor creeps up ~3 dB/s
+        elif self._vad_floor is None:
+            self._vad = 0.0
+            return False
         margin = db - max(self._vad_floor, -90.0) - 12.0
         p = 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, margin / 2.5))))
         if db < -75.0:
@@ -163,10 +292,20 @@ class Pipeline:
         if pending is not None:
             self._pending = None
             self.apply_settings(pending)
+        prof = self._pending_profile
+        if prof is not _UNSET:
+            self._pending_profile = _UNSET
+            self.set_profile(prof)
         s = self.settings
         raw = x * self.in_gain.next_ramp(len(x))
         self.m_clip += int(np.count_nonzero(np.abs(raw) >= 0.999))
-        x = self.hpf.process(raw)
+        pre = self.hpf.process(raw)
+        cap = self._cap
+        if cap is not None and self._cap_pos < len(cap):
+            k = min(len(pre), len(cap) - self._cap_pos)
+            cap[self._cap_pos : self._cap_pos + k] = pre[:k]
+            self._cap_pos += k
+        x = self.notch.process(pre)
 
         enhanced = self.engine.process(x)
         dry = self.dry_for_mix.process(x)
@@ -180,6 +319,13 @@ class Pipeline:
         self._removed_smooth = 0.9 * self._removed_smooth + 0.1 * max(0.0, removed)
 
         voice = self._detect_voice(enhanced)
+        pre_d = self.dry_pre_notch.process(pre)  # aligned with `enhanced`
+        if len(pre_d) >= dsp.BAND_FFT:
+            self._pre_hist = pre_d[-dsp.BAND_FFT:]
+        else:
+            self._pre_hist = np.concatenate([self._pre_hist[len(pre_d):], pre_d])
+        if self._vad < QUIET_VAD:
+            self._track_quiet(pre_d)
         if self._clarity_db:
             y = self.clarity.process(y)
         if s.get("gate_enabled"):

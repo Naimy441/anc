@@ -326,3 +326,26 @@ class StreamResampler:
         self.buf = buf[keep_from:].copy()
         self.t = t_next - keep_from
         return y
+
+
+# Coarse log-spaced bands (100 Hz – 8 kHz) used to fingerprint background noise.
+BAND_FFT = 512
+_band_freqs = np.fft.rfftfreq(BAND_FFT, 1.0 / 48000)
+BAND_EDGES = np.geomspace(100.0, 8000.0, 25)
+_band_idx = np.searchsorted(_band_freqs, BAND_EDGES)
+_band_win = np.hanning(BAND_FFT).astype(np.float32)
+
+
+def band_power(x: np.ndarray) -> np.ndarray:
+    """Mean power in 24 log bands of a block (zero-padded / truncated to 512)."""
+    if len(x) < BAND_FFT:
+        x = np.concatenate([x, np.zeros(BAND_FFT - len(x), dtype=np.float32)])
+    spec = np.fft.rfft(x[:BAND_FFT] * _band_win)
+    p = spec.real * spec.real + spec.imag * spec.imag
+    c = np.concatenate([[0.0], np.cumsum(p)])
+    i = _band_idx
+    return (c[i[1:]] - c[i[:-1]]) / np.maximum(i[1:] - i[:-1], 1)
+
+
+def band_levels(x: np.ndarray) -> np.ndarray:
+    return 10.0 * np.log10(band_power(x) + 1e-20)

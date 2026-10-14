@@ -12,6 +12,7 @@
   const S = {
     settings: {}, state: {}, devices: { inputs: [], outputs: [] }, presets: {}, schema: {},
     tel: null, telAt: 0, connected: false, dragging: null, warnedFeedback: false,
+    profile: null, tune: null,
   };
   const N = 96;
   const disp = { specIn: new Float32Array(N).fill(-120), specOut: new Float32Array(N).fill(-120),
@@ -32,14 +33,16 @@
       switch (m.type) {
         case "hello":
           Object.assign(S, { settings: m.data.settings, state: m.data.state, devices: m.data.devices,
-            presets: m.data.presets, schema: m.data.schema });
-          buildPresets(); renderDevices(); renderSettings(); renderState();
+            presets: m.data.presets, schema: m.data.schema, profile: m.data.profile });
+          buildPresets(); renderDevices(); renderSettings(); renderState(); renderProfile();
           break;
         case "settings": S.settings = m.data; renderSettings(); break;
         case "state": onState(m.data); break;
         case "devices": S.devices = m.data; renderDevices(); break;
         case "telemetry": S.tel = m.data; S.telAt = performance.now(); onTelemetry(m.data); break;
         case "error": toast(m.data, "err"); break;
+        case "tune": onTune(m.data); break;
+        case "profile": onProfile(m.data); break;
       }
     };
   }
@@ -65,7 +68,6 @@
     S.state = st;
     if (st.status === "error" && st.error && st.error !== lastError) toast(st.error, "err");
     lastError = st.error || "";
-    if (was.learning && !st.learning && st.learned) toast("Noise profile captured – switch Noise model to use it", "info");
     renderState();
   }
   function renderState() {
@@ -87,11 +89,13 @@
     $("#fRate").textContent = running ? (st.rate_in === st.rate_out ? `${st.rate_in / 1000} kHz` : `${st.rate_in / 1000}/${st.rate_out / 1000} kHz`) : "–";
     $("#fBlock").textContent = running ? `${st.block} smp` : "–";
     $("#fMode").textContent = running ? st.mode : "–";
-    const learnBtn = $("#learnBtn");
-    learnBtn.disabled = !(running && st.supports_learning);
-    learnBtn.classList.toggle("on", !!st.learning);
-    learnBtn.querySelector("span").textContent = st.learning ? "Listening…" : "Learn noise";
-    $("#learnStatus").textContent = st.learning ? "Capturing – stay quiet…" : st.learned ? "Profile captured ✓" : "No profile captured";
+    const busy = !!(S.tune && ["listening", "analyzing", "spectral", "neural", "hybrid"].includes(S.tune.stage));
+    $("#learnBtn").classList.toggle("on", busy);
+    $("#learnBtn").disabled = busy;
+    $("#learnBtn2").disabled = busy;
+    const bt = running && st.input_native_rate && st.input_native_rate <= 24000;
+    $("#btHint").hidden = !bt;
+    if (bt) $("#btRate").textContent = `${st.input_native_rate / 1000} kHz`;
     if (!running) { $("#topLatency").textContent = "–"; $("#topCpu").textContent = "–"; }
   }
 
@@ -106,6 +110,231 @@
     const c = $("#fClips"); c.textContent = t.clips; c.classList.toggle("bad", t.clips > 0);
     if (t.clips > 0 && !S.clipWarned) { S.clipWarned = true; toast("Input is clipping – lower the input gain or your mic level", "warn"); }
     pushSpectrogram(t.spec_in, t.spec_out);
+    if (t.capture != null && S.tune && S.tune.stage === "listening") renderListen(t.capture);
+    $("#psDrift").textContent = t.drift_db == null ? "–" : `${t.drift_db.toFixed(1)} dB`;
+    $("#psDrift").classList.toggle("bad", t.drift_db != null && t.drift_db > 4);
+  }
+
+  // ------------------------------------------------------------ learn & tune
+  const LISTEN_S = 5;
+  const FAMILY_COL = { spectral: "#22d3ee", neural: "#a78bfa", hybrid: "#f472b6" };
+  const tunerBusy = () => !!(S.tune && !["result", "error"].includes(S.tune.stage));
+  function startLearn() {
+    S.tune = { stage: "listening", progress: 0, cands: [], reason: "user" };
+    scatterAnim.clear();
+    send("learn", { seconds: LISTEN_S });
+    openTuner("listening");
+    renderListen(0);
+    renderState();
+  }
+  function openTuner(stage) {
+    const t = $("#tuner");
+    t.hidden = false;
+    setTunerStage(stage);
+  }
+  function closeTuner() { $("#tuner").hidden = true; if (S.tune && ["result", "error"].includes(S.tune.stage)) S.tune = null; renderState(); }
+  function setTunerStage(stage) {
+    const t = $("#tuner");
+    t.dataset.stage = stage;
+    const order = ["listening", "tuning", "result"];
+    const idx = order.indexOf(stage === "error" ? "result" : stage);
+    $$(".tuner-steps span").forEach((sp, i) => { sp.classList.toggle("on", i === idx); sp.classList.toggle("done", i < idx); });
+  }
+  function renderListen(frac) {
+    $("#listenArc").style.strokeDashoffset = String(553 * (1 - clamp(frac, 0, 1)));
+    $("#listenCount").textContent = Math.max(0, Math.ceil(LISTEN_S * (1 - frac) - 0.05));
+  }
+  const STAGE_TEXT = {
+    analyzing: "Measuring the noise spectrum, hum and stability…",
+    spectral: "Testing 24 statistical (OM-LSA) settings on unseen noise…",
+    neural: "Running DeepFilterNet3 at 6 strengths…",
+    hybrid: "Testing 12 neural + learned-residual combinations…",
+  };
+  function onTune(d) {
+    if (d.reason === "auto") {
+      if (d.stage === "analyzing" && d.progress < 0.05) toast("Background noise changed – re-tuning in the background…", "info");
+      if (d.stage === "error") toast("Background re-tune failed: " + d.error, "warn");
+      return;
+    }
+    S.tune = S.tune || { cands: [] };
+    S.tune.stage = d.stage === "done" ? S.tune.stage : d.stage;
+    S.tune.progress = d.progress ?? S.tune.progress;
+    if (d.candidates) d.candidates.forEach((c) => scatterAnim.add(c));
+    if (d.stage === "listening") openTuner("listening");
+    else if (["analyzing", "spectral", "neural", "hybrid"].includes(d.stage)) {
+      openTuner("tuning");
+      $("#tuneStageText").textContent = STAGE_TEXT[d.stage] || "Tuning…";
+      $("#tuneBar").style.width = Math.round((d.progress || 0) * 100) + "%";
+    } else if (d.stage === "error") {
+      S.tune.stage = "error";
+      $("#tuneError").textContent = d.error === "not running" ? "Processing isn't running. Check your audio devices and try again." : d.error;
+      openTuner("error");
+    }
+    renderState();
+  }
+  function onProfile(p) {
+    const fromUser = S.tune && S.tune.reason !== "auto" && !$("#tuner").hidden;
+    S.profile = p;
+    renderProfile();
+    if (!p) return;
+    if (p.source === "auto") { toast(`Re-tuned for the new background: removing ${p.chosen.removal_db.toFixed(0)} dB`, "info"); return; }
+    if (fromUser || (S.tune && S.tune.stage !== "result")) {
+      S.tune = { ...(S.tune || {}), stage: "result" };
+      if (!scatterAnim.points.length) p.candidates.forEach((c) => scatterAnim.add(c));
+      scatterAnim.finalize(p);
+      renderResult(p);
+      openTuner("result");
+      renderState();
+    }
+  }
+  const artifactWord = (a) => (a < 0.05 ? "None" : a < 0.2 ? "Inaudible" : a < 0.4 ? "Very low" : a < 0.8 ? "Low" : "Noticeable");
+  function engineDesc(c) {
+    const p = c.params || {};
+    if (c.family === "neural") return `<b>Neural</b> (DeepFilterNet3) at <b>${p.reduction}%</b> reduction`;
+    if (c.family === "hybrid") return `<b>Hybrid</b>: neural + learned residual filter, ${p.post_aggressiveness}× over-subtraction, floor ${p.post_floor_db} dB`;
+    return `<b>Spectral</b> with your learned profile, ${p.spectral_aggressiveness}× over-subtraction, floor ${p.spectral_floor_db} dB`;
+  }
+  function renderResult(p) {
+    const c = p.chosen;
+    $("#resultTitle").textContent = p.label;
+    const chips = [];
+    (p.tones || []).forEach((t) => chips.push(`<span class="chip">hum ${t.freq.toFixed(0)} Hz · notched</span>`));
+    chips.push(`<span class="chip cool">${p.noise_dbfs.toFixed(0)} dBFS background</span>`);
+    if (p.rejected_s > 0.2) chips.push(`<span class="chip cool">${p.rejected_s.toFixed(1)} s of sounds ignored</span>`);
+    $("#resultChips").innerHTML = chips.join("");
+    tweenNumber($("#rRemoval"), c.removal_db, 0);
+    $("#rArtifact").textContent = artifactWord(c.artifact);
+    const best = Math.max(...p.candidates.map((x) => x.voice_sdr));
+    $("#rVoice").textContent = c.voice_sdr >= best - 0.25 ? "Best" : `−${(best - c.voice_sdr).toFixed(1)} dB`;
+    const n = p.candidates.length, ok = p.candidates.filter((x) => x.ok).length;
+    $("#resultChoice").innerHTML = `Tested <b>${n}</b> configurations in ${p.tune_seconds.toFixed(1)} s on noise it hadn't trained on; <b>${ok}</b> passed the
+      artifact and voice checks (${p.style}). Applied: ${engineDesc(c)}.${p.kind === "changing" ? " <br>This background changes a lot, so the neural engine is doing most of the work." : ""}`;
+  }
+  function tweenNumber(el, to, digits) {
+    const from = parseFloat(el.textContent) || 0, t0 = performance.now();
+    const stepFn = (now) => {
+      const k = clamp((now - t0) / 900, 0, 1), e = 1 - Math.pow(1 - k, 3);
+      el.textContent = (from + (to - from) * e).toFixed(digits);
+      if (k < 1) requestAnimationFrame(stepFn);
+    };
+    requestAnimationFrame(stepFn);
+  }
+
+  // scatter of candidates: x = noise removed, y = voice quality
+  const scatterAnim = {
+    points: [], chosen: null,
+    clear() { this.points = []; this.chosen = null; },
+    add(c) { this.points.push({ ...c, born: performance.now() + this.points.length * 18 }); },
+    finalize(p) {
+      const byLabel = Object.fromEntries(p.candidates.map((c) => [c.label, c]));
+      this.points.forEach((pt) => Object.assign(pt, byLabel[pt.label] || {}));
+      this.chosen = this.points.find((pt) => pt.label === p.chosen.label) || null;
+      this.chosenAt = performance.now();
+    },
+  };
+  function drawScatter(t) {
+    const c = $("#scatter");
+    if ($("#tuner").hidden || !c.offsetParent) return;
+    fitCanvas(c);
+    const ctx = c.getContext("2d"), W = c.width, H = c.height, d = DPR();
+    ctx.clearRect(0, 0, W, H);
+    const pts = scatterAnim.points;
+    const padL = 52 * d, padB = 26 * d, padT = 12 * d, padR = 12 * d;
+    const xmax = Math.max(40, ...pts.map((p) => p.removal_db)) * 1.05;
+    const ys = pts.map((p) => p.voice_sdr);
+    let ymin = Math.min(0, ...ys), ymax = Math.max(10, ...ys);
+    const yr = ymax - ymin; ymin -= yr * 0.08; ymax += yr * 0.12;
+    const X = (v) => padL + v / xmax * (W - padL - padR), Y = (v) => H - padB - (v - ymin) / (ymax - ymin) * (H - padB - padT);
+    ctx.font = `${10 * d}px ui-monospace, Menlo, monospace`; ctx.fillStyle = "#4b5168"; ctx.strokeStyle = "rgba(255,255,255,0.05)"; ctx.lineWidth = 1;
+    ctx.textAlign = "center";
+    for (let v = 0; v <= xmax; v += 10) { const x = X(v); ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, H - padB); ctx.stroke(); ctx.fillText(v, x, H - 9 * d); }
+    ctx.textAlign = "right";
+    const ystep = (ymax - ymin) > 16 ? 5 : 2;
+    for (let v = Math.ceil(ymin / ystep) * ystep; v <= ymax; v += ystep) { const y = Y(v); ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke(); ctx.fillText(v, padL - 6 * d, y + 3 * d); }
+    ctx.save(); ctx.fillStyle = "#8a91a8"; ctx.textAlign = "left";
+    ctx.fillText("noise removed (dB) →", padL + 4 * d, H - padB - 6 * d);
+    ctx.translate(14 * d, padT + 4 * d); ctx.rotate(Math.PI / 2); ctx.fillText("voice quality (SI-SDR dB) →", 0, 0); ctx.restore();
+    pts.forEach((p) => {
+      const age = clamp((t - p.born) / 400, 0, 1);
+      if (age <= 0) return;
+      const r = (3.2 + 2.2 * (1 - age)) * d * (0.4 + 0.6 * age);
+      const col = FAMILY_COL[p.family] || "#fff";
+      ctx.beginPath(); ctx.arc(X(p.removal_db), Y(p.voice_sdr), r, 0, Math.PI * 2);
+      if (p.ok === false) { ctx.strokeStyle = col + "66"; ctx.lineWidth = 1.3 * d; ctx.stroke(); }
+      else { ctx.fillStyle = col; ctx.globalAlpha = 0.85 * age; ctx.fill(); ctx.globalAlpha = 1; }
+    });
+    const ch = scatterAnim.chosen;
+    if (ch) {
+      const k = clamp((t - scatterAnim.chosenAt) / 700, 0, 1), x = X(ch.removal_db), y = Y(ch.voice_sdr);
+      const pulse = 1 + 0.15 * Math.sin(t / 260);
+      ctx.save(); ctx.shadowColor = "rgba(34,211,238,0.9)"; ctx.shadowBlur = 16 * d;
+      ctx.strokeStyle = "#fff"; ctx.lineWidth = 2 * d; ctx.beginPath(); ctx.arc(x, y, (9 + 14 * (1 - k)) * d * pulse, 0, Math.PI * 2); ctx.stroke(); ctx.restore();
+      ctx.fillStyle = "#e8ebf4"; ctx.font = `600 ${11 * d}px ui-sans-serif, system-ui`; ctx.textAlign = x > W * 0.7 ? "right" : "left";
+      ctx.globalAlpha = k; ctx.fillText("chosen: " + ch.label, x + (x > W * 0.7 ? -16 : 16) * d, y - 12 * d); ctx.globalAlpha = 1;
+    }
+  }
+
+  // mini radial spectrum inside the listening ring
+  function drawListen(t) {
+    const c = $("#listenCanvas");
+    if ($("#tuner").hidden || $("#tuner").dataset.stage !== "listening") return;
+    fitCanvas(c);
+    const ctx = c.getContext("2d"), W = c.width, H = c.height, cx = W / 2, cy = H / 2;
+    ctx.clearRect(0, 0, W, H);
+    const n = 48, r0 = W * 0.3;
+    for (let i = 0; i < n; i++) {
+      const bi = Math.floor(i / n * 80) + 6;
+      const v = clamp((disp.specIn[bi] + 100) / 70, 0, 1);
+      const a = i / n * Math.PI * 2 - Math.PI / 2, len = 2 + v * W * 0.17;
+      ctx.strokeStyle = `hsla(${190 + i * 2}, 90%, 65%, ${0.35 + v * 0.6})`; ctx.lineWidth = 2.2 * DPR(); ctx.lineCap = "round";
+      ctx.beginPath(); ctx.moveTo(cx + Math.cos(a) * r0, cy + Math.sin(a) * r0); ctx.lineTo(cx + Math.cos(a) * (r0 + len), cy + Math.sin(a) * (r0 + len)); ctx.stroke();
+    }
+  }
+
+  // profile panel: learned noise spectrum, hum markers, live background overlay
+  function renderProfile() {
+    const p = S.profile;
+    $("#profileStats").hidden = !p;
+    $("#clearProfile").disabled = !p;
+    const badge = $("#profileBadge");
+    badge.textContent = p ? (p.source === "auto" ? "auto-tuned" : "learned") : "not learned";
+    badge.classList.toggle("ok", !!p);
+    if (!p) {
+      $("#profileMeta").innerHTML = "No profile yet. Press <b>Learn &amp; tune</b> and stay quiet for 5 seconds: ANC measures the background, then tests dozens of settings to find the strongest one that adds no artifacts.";
+      return;
+    }
+    const ago = Math.max(0, (Date.now() / 1000 - p.created));
+    const when = ago < 90 ? "just now" : ago < 5400 ? `${Math.round(ago / 60)} min ago` : ago < 172800 ? `${Math.round(ago / 3600)} h ago` : `${Math.round(ago / 86400)} days ago`;
+    const hum = (p.tones || []).map((t) => t.freq.toFixed(0) + " Hz").join(", ");
+    $("#profileMeta").innerHTML = `<b>${p.label}</b> · learned ${when}${hum ? ` · hum at ${hum}` : ""}<br>Using ${engineDesc(p.chosen)}.`;
+    $("#psRemoval").textContent = `${p.chosen.removal_db.toFixed(0)} dB`;
+    $("#psArtifact").textContent = artifactWord(p.chosen.artifact);
+  }
+  function drawProfile() {
+    const c = $("#profileCanvas"), p = S.profile;
+    if (!c.offsetParent) return;
+    fitCanvas(c);
+    const ctx = c.getContext("2d"), W = c.width, H = c.height, d = DPR();
+    ctx.clearRect(0, 0, W, H);
+    const ys = (v) => H - 6 * d - clamp((v + 110) / 80, 0, 1) * (H - 12 * d);
+    const line = (arr, n) => { const pa = new Path2D(); for (let i = 0; i < n; i++) { const x = i / (n - 1) * W, y = ys(arr[i]); i ? pa.lineTo(x, y) : pa.moveTo(x, y); } return pa; };
+    if (S.state.running) {
+      ctx.strokeStyle = "rgba(251,113,133,0.35)"; ctx.lineWidth = 1.2 * d; ctx.stroke(line(disp.specIn, N));
+    }
+    if (!p || !p.display_db) {
+      ctx.fillStyle = "#4b5168"; ctx.font = `${11 * d}px ui-sans-serif, system-ui`; ctx.textAlign = "center";
+      ctx.fillText(S.state.running ? "live background (not learned yet)" : "no profile", W / 2, H / 2);
+      return;
+    }
+    const pa = line(p.display_db, p.display_db.length);
+    const f = new Path2D(pa); f.lineTo(W, H); f.lineTo(0, H); f.closePath();
+    const g = ctx.createLinearGradient(0, 0, 0, H); g.addColorStop(0, "rgba(99,102,241,0.45)"); g.addColorStop(1, "rgba(34,211,238,0.02)");
+    ctx.fillStyle = g; ctx.fill(f);
+    ctx.strokeStyle = "#818cf8"; ctx.lineWidth = 1.6 * d; ctx.stroke(pa);
+    (p.tones || []).forEach((tn) => {
+      const x = Math.log(tn.freq / FMIN) / Math.log(FMAX / FMIN) * W;
+      ctx.strokeStyle = "rgba(251,191,36,0.8)"; ctx.setLineDash([3 * d, 3 * d]); ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke(); ctx.setLineDash([]);
+    });
   }
 
   // ------------------------------------------------------------------ dial
@@ -216,7 +445,7 @@
     $$(".slider[data-dep]").forEach((el) => el.classList.toggle("dim", !s[el.dataset.dep]));
     $("#bypassBtn").classList.toggle("on", !!s.bypass);
     $("#muteBtn").classList.toggle("on", !!s.mute_output);
-    $("#spectralGroup").classList.toggle("dim", s.engine === "neural");
+    $$("#tuneStyle button").forEach((b) => b.classList.toggle("on", b.dataset.v === s.tune_style));
     $("#topEngine").textContent = { neural: "Neural", hybrid: "Hybrid", spectral: "Spectral" }[s.engine] || "–";
     renderReduction(); renderState(); renderChannels(); feedbackHint();
   }
@@ -233,13 +462,21 @@
     $("#power").addEventListener("click", togglePower);
     $("#bypassBtn").addEventListener("click", () => { set({ bypass: !S.settings.bypass }); renderSettings(); });
     $("#muteBtn").addEventListener("click", () => { set({ mute_output: !S.settings.mute_output }); renderSettings(); });
-    $("#learnBtn").addEventListener("click", () => { send("learn", { seconds: 2.5 }); toast("Stay quiet for 2.5 s while the noise profile is captured", "info"); });
-    $("#clearLearned").addEventListener("click", () => send("clear_learned"));
+    $("#learnBtn").addEventListener("click", startLearn);
+    $("#learnBtn2").addEventListener("click", startLearn);
+    $("#clearProfile").addEventListener("click", () => { send("clear_profile"); toast("Noise profile cleared – back to adaptive tracking"); });
+    $$("#tuneStyle button").forEach((b) => b.addEventListener("click", () => { set({ tune_style: b.dataset.v }); renderSettings(); }));
+    $("#tunerClose").addEventListener("click", closeTuner);
+    $("#tunerDone").addEventListener("click", closeTuner);
+    $("#tunerRetry").addEventListener("click", startLearn);
+    $("#tuner").addEventListener("click", (e) => { if (e.target.id === "tuner" && !tunerBusy()) closeTuner(); });
     $("#refreshDevices").addEventListener("click", (e) => { e.preventDefault(); send("devices"); toast("Rescanning audio devices…"); });
     $("#resetBtn").addEventListener("click", () => send("reset"));
     segmented("#specMode", (v) => (viz.specMode = v));
     segmented("#sgramMode", (v) => { viz.sgMode = v; clearSgram(); });
     document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && !$("#tuner").hidden) { if (!tunerBusy()) closeTuner(); return; }
+      if (!$("#tuner").hidden) return;
       if (e.target.matches("input, select, textarea") && e.key !== "Escape") return;
       if (e.code === "Space") { e.preventDefault(); togglePower(); }
       else if (e.key === "b" || e.key === "B") { set({ bypass: !S.settings.bypass }); renderSettings(); }
@@ -504,7 +741,7 @@
       disp.inPk = lerp(disp.inPk, -90, 0.1); disp.outPk = lerp(disp.outPk, -90, 0.1);
       disp.removed = lerp(disp.removed, 0, 0.08); disp.voice = lerp(disp.voice, 0, 0.1); disp.level *= 0.9;
     }
-    drawSpectrum(); drawRing(t); drawMeters(); labFrame();
+    drawSpectrum(); drawRing(t); drawMeters(); labFrame(); drawScatter(t); drawListen(t); drawProfile();
     requestAnimationFrame(frame);
   }
 

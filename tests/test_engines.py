@@ -61,9 +61,36 @@ def test_reset_is_deterministic(make_noise):
     np.testing.assert_allclose(a, b, atol=1e-5)
 
 
-def test_spectral_learned_profile(make_noise):
-    eng = create_engine("spectral")
-    eng.configure({"noise_mode": "learned"})
-    eng.start_learning(0.5)
-    run(eng, make_noise(1.0))
-    assert eng.learned is not None and not eng.learning
+def test_spectral_batch_matches_single(make_voice, make_noise):
+    """The tuner's parallel candidates run exactly the runtime code path."""
+    x = make_voice(1.0) + make_noise(1.0)
+    single = create_engine("spectral")
+    single.configure({"spectral_aggressiveness": 1.4, "spectral_floor_db": -25})
+    batch = create_engine("spectral")
+    batch.configure({})
+    batch.set_candidates([1.4, 2.0], [-25, -35])
+    from anc.autotune import _run
+
+    a = _run(single, x)
+    b = _run(batch, x)
+    assert b.shape[0] == 2
+    np.testing.assert_allclose(a, b[0], atol=1e-6)
+    assert not np.allclose(b[0], b[1])
+
+
+def test_learned_profile_beats_adaptive_on_steady_noise(make_fan, make_voice):
+    from anc.autotune import si_sdr
+
+    noise = make_fan(4.0)
+    learn, test = noise[: len(noise) // 2], noise[len(noise) // 2 :]
+    v = make_voice(len(test) / 48000)
+    v = v * (np.std(test) / np.std(v)) * 10 ** (5 / 20)
+    mix = test + v
+    res = {}
+    for mode in ("adaptive", "learned"):
+        eng = create_engine("spectral")
+        eng.configure({"noise_mode": mode, "spectral_floor_db": -25})
+        eng.learned = eng.psd_of(learn)
+        y = run(eng, mix)[eng.latency : eng.latency + len(mix)]
+        res[mode] = si_sdr(v[20000:], y[20000:])
+    assert res["learned"] > res["adaptive"] + 1.0

@@ -26,6 +26,12 @@ SCHEMA: dict[str, tuple] = {
     "limiter_ceiling_db": (float, -1.0, -12.0, 0.0),
     "spectral_aggressiveness": (float, 1.0, 0.5, 3.0),
     "spectral_smoothing": (float, 0.98, 0.8, 0.995),
+    "spectral_floor_db": (float, -40.0, -60.0, -6.0),
+    "post_aggressiveness": (float, 1.0, 0.5, 3.0),
+    "post_floor_db": (float, -18.0, -40.0, -6.0),
+    "tune_style": (str, "balanced", ("gentle", "balanced", "max")),
+    "auto_retune": (bool, True),
+    "hum_notch_enabled": (bool, True),
     "noise_mode": (str, "adaptive", ("adaptive", "learned", "hybrid")),
     "latency_mode": (str, "balanced", ("ultra", "balanced", "safe")),
     "input_device": (object, None),
@@ -120,11 +126,33 @@ def config_dir() -> Path:
 
 
 class Store:
-    """Thread-safe settings persistence (JSON in ~/.anc/settings.json)."""
+    """Thread-safe persistence: settings in ~/.anc/settings.json, the learned noise
+    profile in ~/.anc/profile.json (next to it)."""
 
     def __init__(self, path: Path | None = None):
         self.path = path or (config_dir() / "settings.json")
+        self.profile_path = self.path.with_name("profile.json")
         self.lock = threading.Lock()
+
+    def load_profile(self) -> dict | None:
+        try:
+            p = json.loads(self.profile_path.read_text())
+            return p if isinstance(p, dict) and "psd_raw" in p and "bands_db" in p else None
+        except Exception:
+            return None
+
+    def save_profile(self, profile: dict | None) -> None:
+        with self.lock:
+            try:
+                if profile is None:
+                    self.profile_path.unlink(missing_ok=True)
+                    return
+                self.profile_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = self.profile_path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(profile))
+                tmp.replace(self.profile_path)
+            except OSError:
+                pass
 
     def load(self) -> dict:
         try:

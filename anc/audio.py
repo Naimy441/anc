@@ -3,8 +3,8 @@
 Runs in its own process so the PortAudio callback never competes with the web
 server for the GIL. The parent talks to it over a ``multiprocessing`` pipe:
 
-    parent -> worker : (cmd, payload)   start / stop / settings / devices / learn / ...
-    worker -> parent : (kind, payload)  state / telemetry / devices / error / log
+    parent -> worker : (cmd, payload)   start / stop / settings / devices / capture / profile
+    worker -> parent : (kind, payload)  state / telemetry / devices / captured / error / log
 
 Device handling:
 * Full-duplex stream at 48 kHz when both devices support it (zero extra buffering:
@@ -146,7 +146,9 @@ class AudioWorker:
         self._win = np.hanning(FFT_N).astype(np.float32)
         self._win_norm = float(np.sum(self._win) / 2)
         self._last_cb = 0.0
-        self._restart_needed = False
+        self.profile: dict | None = None
+        self.in_native_rate = RATE
+        self._last_retune = 0.0
 
     # ------------------------------------------------------------------ comms
     def send(self, kind: str, payload) -> None:
@@ -156,12 +158,6 @@ class AudioWorker:
             pass
 
     def state(self) -> dict:
-        learned = False
-        learning = False
-        eng = self.pipe.engine if self.pipe else None
-        if eng is not None:
-            learned = getattr(eng, "learned", None) is not None
-            learning = bool(getattr(eng, "learning", False))
         return {
             "running": self.running,
             "status": self.status,
@@ -174,9 +170,9 @@ class AudioWorker:
             "device_latency_ms": self.device_latency * 1000,
             "input_name": self.in_name,
             "output_name": self.out_name,
-            "learned": learned,
-            "learning": learning,
-            "supports_learning": eng is not None and hasattr(eng, "start_learning"),
+            "input_native_rate": self.in_native_rate,
+            "profile_active": self.profile is not None,
+            "capturing": bool(self.pipe and self.pipe.capture_progress is not None),
             "simulate": self.simulate,
         }
 
@@ -246,6 +242,7 @@ class AudioWorker:
         self.send("state", self.state())
         try:
             self.pipe = Pipeline(s, engine=self._engine(s.get("engine", "neural")), block_mult=mult)
+            self.pipe.set_profile(self.profile)
             self.xruns = self.underruns = 0
             if self.simulate or self.sd is None:
                 if self.sd is None and not self.simulate:
@@ -289,6 +286,7 @@ class AudioWorker:
         in_dev, in_info = self._resolve(s.get("input_device"), "input")
         out_dev, out_info = self._resolve(s.get("output_device"), "output")
         self.in_name, self.out_name = in_info["name"], out_info["name"]
+        self.in_native_rate = int(in_info["default_samplerate"])
         ch_sel = int(s.get("input_channel", -1))
         max_in = int(in_info["max_input_channels"])
         in_ch = min(max_in, max(2, ch_sel + 1) if ch_sel >= 0 else min(max_in, 2))
@@ -547,7 +545,10 @@ class AudioWorker:
             "spec_out": self._spectrum(out),
             "wave_in": np.round(np.abs(wi).max(axis=1), 4).tolist(),
             "wave_out": np.round(np.abs(wo).max(axis=1), 4).tolist(),
-            "learning": bool(getattr(p.engine, "learning", False)),
+            "capture": None if p.capture_progress is None else round(p.capture_progress, 3),
+            "profile": self.profile is not None,
+            "drift_db": round(p.m_drift_db, 2) if self.profile is not None else None,
+            "quiet_s": round(p.quiet_seconds, 1),
         }
 
     # ------------------------------------------------------------------ loop
@@ -565,17 +566,20 @@ class AudioWorker:
                 self.send("devices", self.list_devices())
             except Exception as e:
                 self.send("error", f"Device scan failed: {e}")
-        elif cmd == "learn":
-            eng = self.pipe.engine if self.pipe else None
-            if eng is not None and hasattr(eng, "start_learning") and self.running:
-                eng.start_learning(float(payload or 2.0))
+        elif cmd == "capture":
+            if self.running and self.pipe is not None:
+                self.pipe.start_capture(float(payload or 5.0))
             else:
-                self.send("error", "Noise learning needs a running Spectral or Hybrid engine")
+                self.send("error", "Activate processing first, then learn the noise")
+                self.send("tune", {"stage": "error", "error": "not running"})
             self.send("state", self.state())
-        elif cmd == "clear_learned":
-            eng = self.pipe.engine if self.pipe else None
-            if eng is not None and hasattr(eng, "clear_learned"):
-                eng.clear_learned()
+        elif cmd == "profile":
+            self.profile = payload
+            if self.pipe is not None:
+                if self.running:
+                    self.pipe.request_profile(payload)
+                else:
+                    self.pipe.set_profile(payload)
             self.send("state", self.state())
         elif cmd == "state":
             self.send("state", self.state())
@@ -584,10 +588,29 @@ class AudioWorker:
             return False
         return True
 
+    def _poll_profile_work(self) -> None:
+        """Hand finished captures – and, when the background has drifted, recent
+        noise-only audio – to the parent for (re-)tuning."""
+        p = self.pipe
+        if p is None:
+            return
+        meta = {"input_gain_db": float(self.settings.get("input_gain_db", 0.0)),
+                "engine": self.settings.get("engine", "neural")}
+        cap = p.take_capture()
+        if cap is not None:
+            self.send("captured", {"audio": cap, "reason": "user", **meta})
+            self.send("state", self.state())
+            return
+        now = time.time()
+        if (self.profile is not None and p.stale and self.settings.get("auto_retune", True)
+                and now - self._last_retune > 45.0 and p.quiet_seconds >= 3.0):
+            self._last_retune = now
+            p.stale = False
+            self.send("captured", {"audio": p.take_quiet(5.0), "reason": "auto", **meta})
+
     def loop(self) -> None:
         period = 1.0 / 30.0
         nxt = time.perf_counter()
-        was_learning = False
         alive = True
         self.send("devices", self.list_devices())
         self.send("state", self.state())
@@ -606,9 +629,7 @@ class AudioWorker:
             tel = self.telemetry()
             if tel is not None:
                 self.send("telemetry", tel)
-                if was_learning and not tel["learning"]:
-                    self.send("state", self.state())
-                was_learning = tel["learning"]
+                self._poll_profile_work()
                 # Device vanished (unplugged) -> report and stop.
                 if self.streams and not self.simulate:
                     try:

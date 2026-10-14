@@ -110,3 +110,60 @@ def test_server_api(tmp_path, monkeypatch, make_voice, make_noise):
         assert sr == 48000 and len(y) == 48000
         bad = client.post("/api/process", files={"file": ("x.wav", b"not audio", "audio/wav")})
         assert bad.status_code == 400
+
+
+def test_learn_and_tune_flow(tmp_path):
+    """Learn & tune end to end: capture from the (simulated) input, tune in the
+    server, persist the profile, apply settings, and clear it again."""
+    from fastapi.testclient import TestClient
+
+    from anc.config import Store
+    from anc.server import create_app
+
+    store = Store(tmp_path / "s.json")
+    app = create_app(simulate=True, store=store)
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            assert ws.receive_json()["type"] == "hello"
+            ws.send_json({"op": "learn", "seconds": 2.5})
+            stages, profile, settings = [], None, None
+            for _ in range(3000):
+                m = ws.receive_json()
+                if m["type"] == "tune":
+                    stages.append(m["data"]["stage"])
+                    assert m["data"]["stage"] != "error", m["data"]
+                elif m["type"] == "settings":
+                    settings = m["data"]
+                elif m["type"] == "profile":
+                    profile = m["data"]
+                    break
+        assert profile is not None and "psd_raw" not in profile
+        assert stages[0] == "listening" and "done" in stages
+        assert settings["noise_mode"] == "learned"
+        assert settings["engine"] == profile["chosen"]["family"]
+        assert store.load_profile() is not None
+        assert client.get("/api/profile").json()["chosen"]["label"] == profile["chosen"]["label"]
+        assert client.delete("/api/profile").status_code == 200
+        assert client.get("/api/profile").json() is None
+        assert store.load_profile() is None
+        assert client.get("/api/state").json()["settings"]["noise_mode"] == "adaptive"
+
+
+def test_worker_requests_background_retune(make_fan):
+    """A stale profile + enough noise-only audio -> worker asks the server to re-tune."""
+    w = AudioWorker(FakeConn(), simulate=True)
+    w.settings = validate({"engine": "spectral", "auto_retune": True})
+    w.pipe = Pipeline(w.settings, engine=w._engine("spectral"))
+    w.profile = {"bands_db": [0.0] * 24}
+    x = make_fan(4.0)
+    for k in range(0, len(x) - w.pipe.block, w.pipe.block):
+        w.pipe.process(x[k : k + w.pipe.block])
+    w.pipe.stale = True
+    w._poll_profile_work()
+    sent = [m for m in w.conn.sent if m[0] == "captured"]
+    assert len(sent) == 1 and sent[0][1]["reason"] == "auto"
+    assert len(sent[0][1]["audio"]) >= 3 * 48000
+    # cooldown: a second stale flag right away does not re-trigger
+    w.pipe.stale = True
+    w._poll_profile_work()
+    assert len([m for m in w.conn.sent if m[0] == "captured"]) == 1
